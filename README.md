@@ -1,6 +1,9 @@
 # zig_eval
 
-Evals library written in Zig, for use with Agent Harnesses like [scalabs/zig_coding_agent](https://github.com/scalabs/zig_coding_agent)
+`zig_eval` is a Zig eval library for agent and LLM systems.
+
+The planned v1 package will be registry-driven and OpenAI-compatible. The
+current state of this repository is the package skeleton only.
 
 ## Resources
 
