@@ -1,0 +1,13 @@
+{
+  "id": "smoke.reply_ok",
+  "group": "smoke",
+  "description": "Checks whether the model can follow a simple instruction and reply with OK only.",
+  "dataset_path": "registry/data/smoke/reply_ok/test.jsonl",
+  "split": "test",
+  "matcher": {
+    "kind": "exact_match",
+    "case_sensitive": false,
+    "trim_whitespace": true
+  },
+  "default_run_count": 1
+}

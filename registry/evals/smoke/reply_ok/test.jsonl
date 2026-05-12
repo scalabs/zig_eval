@@ -1,0 +1,3 @@
+{"id":"case-1","input":"Reply with only OK.","ideal":"OK"}
+{"id":"case-2","input":"Say OK and nothing else.","ideal":"OK"}
+{"id":"case-3","input":"Your entire answer must be OK.","ideal":"OK"}
