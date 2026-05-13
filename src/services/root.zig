@@ -24,6 +24,24 @@ pub const LoadedServices = struct {
     }
 };
 
+pub const ChatCallInput = struct {
+    prompt: []const u8,
+    system_prompt_override: ?[]const u8 = null,
+    model_override: ?[]const u8 = null,
+};
+
+pub const ChatCallOutput = struct {
+    content: []u8,
+    model: []u8,
+    status_code: u16,
+
+    pub fn deinit(self: *ChatCallOutput, allocator: std.mem.Allocator) void {
+        allocator.free(self.content);
+        allocator.free(self.model);
+        self.* = undefined;
+    }
+};
+
 pub fn loadServices(
     allocator: std.mem.Allocator,
     dir: std.fs.Dir,
@@ -61,6 +79,64 @@ pub fn loadServices(
     };
 }
 
+pub fn callChatCompletion(
+    allocator: std.mem.Allocator,
+    service: ServiceConfig,
+    input: ChatCallInput,
+) !ChatCallOutput {
+    const model_name = selectModelName(service, input);
+    const system_prompt = selectSystemPrompt(service, input);
+
+    const endpoint = try normalizeChatCompletionsUrl(allocator, service.base_url);
+    defer allocator.free(endpoint);
+    const uri = try std.Uri.parse(endpoint);
+
+    const payload = try renderChatPayloadJsonAlloc(
+        allocator,
+        model_name,
+        input.prompt,
+        system_prompt,
+        service.provider,
+    );
+    defer allocator.free(payload);
+
+    var headers = std.ArrayList(std.http.Header){};
+    defer headers.deinit(allocator);
+    try headers.append(allocator, .{ .name = "content-type", .value = "application/json" });
+
+    const api_key = try readApiKeyFromEnv(allocator, service.api_key_env);
+    defer if (api_key) |key| allocator.free(key);
+
+    var auth_header_value: ?[]u8 = null;
+    defer if (auth_header_value) |value| allocator.free(value);
+
+    if (api_key) |key| {
+        auth_header_value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{key});
+        try headers.append(allocator, .{ .name = "authorization", .value = auth_header_value.? });
+    }
+
+    var client = std.http.Client{ .allocator = allocator };
+    defer client.deinit();
+
+    var response_writer = std.Io.Writer.Allocating.init(allocator);
+    defer response_writer.deinit();
+
+    const fetch_result = try client.fetch(.{
+        .location = .{ .uri = uri },
+        .method = .POST,
+        .payload = payload,
+        .extra_headers = headers.items,
+        .response_writer = &response_writer.writer,
+    });
+
+    return try parseChatCompletionResponse(
+        allocator,
+        fetch_result.status,
+        response_writer.written(),
+        model_name,
+    );
+}
+
 fn parseServiceConfig(
     allocator: std.mem.Allocator,
     value: std.json.Value,
@@ -79,6 +155,224 @@ fn parseServiceConfig(
         .system_prompt = try dupOptionalString(allocator, object, "system_prompt"),
         .timeout_ms = try parseRequiredU32(object, "timeout_ms"),
     };
+}
+
+fn selectModelName(
+    service: ServiceConfig,
+    input: ChatCallInput,
+) []const u8 {
+    if (input.model_override) |override| {
+        const trimmed = std.mem.trim(u8, override, " \t\r\n");
+        if (trimmed.len > 0) return trimmed;
+    }
+    return service.default_model;
+}
+
+fn selectSystemPrompt(
+    service: ServiceConfig,
+    input: ChatCallInput,
+) ?[]const u8 {
+    if (input.system_prompt_override) |override| {
+        const trimmed = std.mem.trim(u8, override, " \t\r\n");
+        if (trimmed.len > 0) return trimmed;
+    }
+    if (service.system_prompt) |configured| {
+        const trimmed = std.mem.trim(u8, configured, " \t\r\n");
+        if (trimmed.len > 0) return trimmed;
+    }
+    return null;
+}
+
+fn readApiKeyFromEnv(
+    allocator: std.mem.Allocator,
+    env_name: []const u8,
+) !?[]u8 {
+    const raw = std.process.getEnvVarOwned(allocator, env_name) catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => return null,
+        else => return err,
+    };
+    errdefer allocator.free(raw);
+
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) {
+        allocator.free(raw);
+        return null;
+    }
+
+    if (trimmed.ptr == raw.ptr and trimmed.len == raw.len) {
+        return raw;
+    }
+
+    const duped = try allocator.dupe(u8, trimmed);
+    allocator.free(raw);
+    return duped;
+}
+
+fn normalizeChatCompletionsUrl(
+    allocator: std.mem.Allocator,
+    base_url: []const u8,
+) ![]u8 {
+    const trimmed = std.mem.trim(u8, base_url, " \t\r\n");
+    if (trimmed.len == 0) return error.InvalidServiceConfig;
+
+    if (std.mem.endsWith(u8, trimmed, "/v1/chat/completions")) {
+        return allocator.dupe(u8, trimmed);
+    }
+    if (std.mem.endsWith(u8, trimmed, "/chat/completions")) {
+        return allocator.dupe(u8, trimmed);
+    }
+    if (std.mem.endsWith(u8, trimmed, "/v1")) {
+        return std.fmt.allocPrint(allocator, "{s}/chat/completions", .{trimmed});
+    }
+    if (std.mem.endsWith(u8, trimmed, "/v1/")) {
+        return std.fmt.allocPrint(allocator, "{s}chat/completions", .{trimmed});
+    }
+    if (std.mem.endsWith(u8, trimmed, "/")) {
+        return std.fmt.allocPrint(allocator, "{s}v1/chat/completions", .{trimmed});
+    }
+    return std.fmt.allocPrint(allocator, "{s}/v1/chat/completions", .{trimmed});
+}
+
+fn renderChatPayloadJsonAlloc(
+    allocator: std.mem.Allocator,
+    model: []const u8,
+    prompt: []const u8,
+    system_prompt: ?[]const u8,
+    provider: ?[]const u8,
+) ![]u8 {
+    var out = std.Io.Writer.Allocating.init(allocator);
+    errdefer out.deinit();
+
+    var json_writer = std.json.Stringify{
+        .writer = &out.writer,
+        .options = .{},
+    };
+
+    try json_writer.beginObject();
+
+    try json_writer.objectField("model");
+    try json_writer.write(model);
+
+    try json_writer.objectField("messages");
+    try json_writer.beginArray();
+
+    if (system_prompt) |value| {
+        try writeMessageObject(&json_writer, "system", value);
+    }
+    try writeMessageObject(&json_writer, "user", prompt);
+    try json_writer.endArray();
+
+    try json_writer.objectField("stream");
+    try json_writer.write(false);
+
+    if (provider) |value| {
+        const trimmed = std.mem.trim(u8, value, " \t\r\n");
+        if (trimmed.len > 0) {
+            try json_writer.objectField("provider");
+            try json_writer.write(trimmed);
+        }
+    }
+
+    try json_writer.endObject();
+    return try out.toOwnedSlice();
+}
+
+fn writeMessageObject(
+    json_writer: *std.json.Stringify,
+    role: []const u8,
+    content: []const u8,
+) !void {
+    try json_writer.beginObject();
+    try json_writer.objectField("role");
+    try json_writer.write(role);
+    try json_writer.objectField("content");
+    try json_writer.write(content);
+    try json_writer.endObject();
+}
+
+fn parseChatCompletionResponse(
+    allocator: std.mem.Allocator,
+    status: std.http.Status,
+    raw: []const u8,
+    fallback_model: []const u8,
+) !ChatCallOutput {
+    if (status != .ok) {
+        const detail = extractUpstreamErrorMessage(allocator, raw) catch null;
+        if (detail) |message| allocator.free(message);
+        return error.UpstreamHttpError;
+    }
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch {
+        return error.InvalidUpstreamJson;
+    };
+    defer parsed.deinit();
+
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidUpstreamJson,
+    };
+
+    const model = if (root.get("model")) |value|
+        switch (value) {
+            .string => |text| text,
+            else => fallback_model,
+        }
+    else
+        fallback_model;
+
+    const choices = switch (root.get("choices") orelse return error.MalformedSuccessPayload) {
+        .array => |array| array.items,
+        else => return error.MalformedSuccessPayload,
+    };
+    if (choices.len == 0) return error.MalformedSuccessPayload;
+
+    const choice_object = switch (choices[0]) {
+        .object => |object| object,
+        else => return error.MalformedSuccessPayload,
+    };
+
+    const message_object = switch (choice_object.get("message") orelse return error.MalformedSuccessPayload) {
+        .object => |object| object,
+        else => return error.MalformedSuccessPayload,
+    };
+
+    const content = switch (message_object.get("content") orelse return error.MalformedSuccessPayload) {
+        .string => |value| value,
+        else => return error.MalformedSuccessPayload,
+    };
+
+    return .{
+        .content = try allocator.dupe(u8, content),
+        .model = try allocator.dupe(u8, model),
+        .status_code = @intFromEnum(status),
+    };
+}
+
+fn extractUpstreamErrorMessage(
+    allocator: std.mem.Allocator,
+    raw: []const u8,
+) !?[]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch {
+        return null;
+    };
+    defer parsed.deinit();
+
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return null,
+    };
+
+    const error_value = root.get("error") orelse return null;
+    const message = switch (error_value) {
+        .object => |error_object| switch (error_object.get("message") orelse return null) {
+            .string => |value| value,
+            else => return null,
+        },
+        .string => |value| value,
+        else => return null,
+    };
+
+    return try allocator.dupe(u8, message);
 }
 
 fn dupRequiredString(
@@ -193,5 +487,111 @@ test "loadServices rejects missing required fields" {
     try std.testing.expectError(
         error.InvalidServiceConfig,
         loadServices(std.testing.allocator, tmp.dir, "registry/services.json"),
+    );
+}
+
+test "normalizeChatCompletionsUrl handles v1 endpoint variants" {
+    const cases = [_]struct {
+        input: []const u8,
+        expected: []const u8,
+    }{
+        .{ .input = "http://127.0.0.1:8081", .expected = "http://127.0.0.1:8081/v1/chat/completions" },
+        .{ .input = "http://127.0.0.1:8081/", .expected = "http://127.0.0.1:8081/v1/chat/completions" },
+        .{ .input = "http://127.0.0.1:8081/v1", .expected = "http://127.0.0.1:8081/v1/chat/completions" },
+        .{ .input = "http://127.0.0.1:8081/v1/", .expected = "http://127.0.0.1:8081/v1/chat/completions" },
+        .{ .input = "http://127.0.0.1:8081/v1/chat/completions", .expected = "http://127.0.0.1:8081/v1/chat/completions" },
+    };
+
+    for (cases) |case| {
+        const actual = try normalizeChatCompletionsUrl(std.testing.allocator, case.input);
+        defer std.testing.allocator.free(actual);
+        try std.testing.expectEqualStrings(case.expected, actual);
+    }
+}
+
+test "renderChatPayloadJsonAlloc includes messages stream and provider" {
+    const payload = try renderChatPayloadJsonAlloc(
+        std.testing.allocator,
+        "gpt-4.1-mini",
+        "Reply with OK",
+        "Follow instructions exactly.",
+        "openai",
+    );
+    defer std.testing.allocator.free(payload);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+    try std.testing.expectEqualStrings("gpt-4.1-mini", root.get("model").?.string);
+    try std.testing.expectEqual(false, root.get("stream").?.bool);
+    try std.testing.expectEqualStrings("openai", root.get("provider").?.string);
+
+    const messages = root.get("messages").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), messages.len);
+    try std.testing.expectEqualStrings("system", messages[0].object.get("role").?.string);
+    try std.testing.expectEqualStrings("user", messages[1].object.get("role").?.string);
+}
+
+test "parseChatCompletionResponse parses valid success body" {
+    const raw =
+        \\{
+        \\  "id": "chatcmpl-test",
+        \\  "model": "gpt-4.1-mini",
+        \\  "choices": [
+        \\    {
+        \\      "message": {
+        \\        "role": "assistant",
+        \\        "content": "OK"
+        \\      }
+        \\    }
+        \\  ]
+        \\}
+    ;
+
+    var output = try parseChatCompletionResponse(std.testing.allocator, .ok, raw, "fallback-model");
+    defer output.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("OK", output.content);
+    try std.testing.expectEqualStrings("gpt-4.1-mini", output.model);
+    try std.testing.expectEqual(@as(u16, 200), output.status_code);
+}
+
+test "parseChatCompletionResponse returns error for non-200 with json error body" {
+    const raw =
+        \\{
+        \\  "error": {
+        \\    "message": "invalid_api_key"
+        \\  }
+        \\}
+    ;
+    try std.testing.expectError(
+        error.UpstreamHttpError,
+        parseChatCompletionResponse(std.testing.allocator, .unauthorized, raw, "fallback-model"),
+    );
+}
+
+test "parseChatCompletionResponse rejects malformed success payload" {
+    const raw_missing_choices =
+        \\{
+        \\  "model": "gpt-4.1-mini"
+        \\}
+    ;
+    try std.testing.expectError(
+        error.MalformedSuccessPayload,
+        parseChatCompletionResponse(std.testing.allocator, .ok, raw_missing_choices, "fallback-model"),
+    );
+
+    const raw_missing_content =
+        \\{
+        \\  "model": "gpt-4.1-mini",
+        \\  "choices": [
+        \\    { "message": { "role": "assistant" } }
+        \\  ]
+        \\}
+    ;
+    try std.testing.expectError(
+        error.MalformedSuccessPayload,
+        parseChatCompletionResponse(std.testing.allocator, .ok, raw_missing_content, "fallback-model"),
     );
 }
