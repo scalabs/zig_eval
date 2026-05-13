@@ -37,7 +37,7 @@ test "EvalReport stores grouped report shapes" {
     };
     const service_reports = [_]ServiceReport{
         .{
-            .service_name = "local-router",
+            .service_name = "product-api",
             .counts = .{
                 .total_runs = 10,
                 .passed = 9,

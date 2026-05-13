@@ -18,7 +18,7 @@ test "RunResult represents one evaluated case" {
     const result = RunResult{
         .group = "structured_output",
         .eval_id = "json.basic",
-        .service_name = "local-router",
+        .service_name = "product-api",
         .model = "gpt-4.1-mini",
         .run_index = 1,
         .case_id = "case-7",

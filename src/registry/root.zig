@@ -304,7 +304,7 @@ fn parseOptionalStringList(
 }
 
 test "EvalDefinition and EvalCase store registry metadata" {
-    const services = [_][]const u8{ "local-router", "bedrock" };
+    const services = [_][]const u8{ "product-api", "staging-api" };
     const definition = EvalDefinition{
         .id = "smoke.reply_ok",
         .group = "smoke",

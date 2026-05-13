@@ -5,7 +5,7 @@ const max_file_bytes = 1024 * 1024;
 pub const ServiceConfig = struct {
     name: []const u8,
     base_url: []const u8,
-    api_key_env: []const u8,
+    api_key_env: ?[]const u8 = null,
     default_model: []const u8,
     provider: ?[]const u8 = null,
     system_prompt: ?[]const u8 = null,
@@ -149,7 +149,7 @@ fn parseServiceConfig(
     return .{
         .name = try dupRequiredString(allocator, object, "name"),
         .base_url = try dupRequiredString(allocator, object, "base_url"),
-        .api_key_env = try dupRequiredString(allocator, object, "api_key_env"),
+        .api_key_env = try dupOptionalString(allocator, object, "api_key_env"),
         .default_model = try dupRequiredString(allocator, object, "default_model"),
         .provider = try dupOptionalString(allocator, object, "provider"),
         .system_prompt = try dupOptionalString(allocator, object, "system_prompt"),
@@ -185,9 +185,13 @@ fn selectSystemPrompt(
 
 fn readApiKeyFromEnv(
     allocator: std.mem.Allocator,
-    env_name: []const u8,
+    env_name: ?[]const u8,
 ) !?[]u8 {
-    const raw = std.process.getEnvVarOwned(allocator, env_name) catch |err| switch (err) {
+    const configured_env = env_name orelse return null;
+    const trimmed_env = std.mem.trim(u8, configured_env, " \t\r\n");
+    if (trimmed_env.len == 0) return null;
+
+    const raw = std.process.getEnvVarOwned(allocator, trimmed_env) catch |err| switch (err) {
         error.EnvironmentVariableNotFound => return null,
         else => return err,
     };
@@ -420,7 +424,7 @@ fn parseRequiredU32(
 
 test "ServiceConfig stores v1 fields" {
     const service = ServiceConfig{
-        .name = "local-router",
+        .name = "product-api",
         .base_url = "http://127.0.0.1:8081/v1/chat/completions",
         .api_key_env = "OPENAI_API_KEY",
         .default_model = "gpt-4.1-mini",
@@ -429,7 +433,7 @@ test "ServiceConfig stores v1 fields" {
         .timeout_ms = 30_000,
     };
 
-    try std.testing.expectEqualStrings("local-router", service.name);
+    try std.testing.expectEqualStrings("product-api", service.name);
     try std.testing.expectEqualStrings("openai", service.provider.?);
     try std.testing.expectEqual(@as(u32, 30_000), service.timeout_ms);
 }
@@ -444,7 +448,7 @@ test "loadServices loads valid services.json" {
         .data =
         \\[
         \\  {
-        \\    "name": "local-router",
+        \\    "name": "product-api",
         \\    "base_url": "http://127.0.0.1:8081/v1/chat/completions",
         \\    "api_key_env": "OPENAI_API_KEY",
         \\    "default_model": "gpt-4.1-mini",
@@ -460,8 +464,35 @@ test "loadServices loads valid services.json" {
     defer loaded.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), loaded.items.len);
-    try std.testing.expectEqualStrings("local-router", loaded.items[0].name);
+    try std.testing.expectEqualStrings("product-api", loaded.items[0].name);
     try std.testing.expectEqualStrings("openai", loaded.items[0].provider.?);
+}
+
+test "loadServices allows unauthenticated product endpoints" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("registry");
+    try tmp.dir.writeFile(.{
+        .sub_path = "registry/services.json",
+        .data =
+        \\[
+        \\  {
+        \\    "name": "internal-product",
+        \\    "base_url": "http://127.0.0.1:9000/v1/chat/completions",
+        \\    "default_model": "eval-model",
+        \\    "timeout_ms": 15000
+        \\  }
+        \\]
+        ,
+    });
+
+    var loaded = try loadServices(std.testing.allocator, tmp.dir, "registry/services.json");
+    defer loaded.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), loaded.items.len);
+    try std.testing.expectEqualStrings("internal-product", loaded.items[0].name);
+    try std.testing.expect(loaded.items[0].api_key_env == null);
 }
 
 test "loadServices rejects missing required fields" {
