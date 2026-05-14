@@ -49,6 +49,8 @@ pub const OwnedEvalReports = struct {
     }
 };
 
+pub const json_schema_version: u32 = 1;
+
 pub fn aggregateRunResults(
     allocator: std.mem.Allocator,
     results: []const runner.RunResult,
@@ -83,6 +85,42 @@ pub fn formatEvalReports(writer: anytype, reports: []const EvalReport) !void {
         if (index > 0) try writer.writeByte('\n');
         try formatEvalReport(writer, report);
     }
+}
+
+pub fn formatRunResultsJson(writer: anytype, results: []const runner.RunResult) !void {
+    var json_writer = std.json.Stringify{
+        .writer = writer,
+        .options = .{},
+    };
+
+    try json_writer.beginObject();
+    try json_writer.objectField("schema_version");
+    try json_writer.write(json_schema_version);
+    try json_writer.objectField("runs");
+    try json_writer.beginArray();
+    for (results) |result| {
+        try writeRunResultJson(&json_writer, result);
+    }
+    try json_writer.endArray();
+    try json_writer.endObject();
+}
+
+pub fn formatEvalReportsJson(writer: anytype, reports: []const EvalReport) !void {
+    var json_writer = std.json.Stringify{
+        .writer = writer,
+        .options = .{},
+    };
+
+    try json_writer.beginObject();
+    try json_writer.objectField("schema_version");
+    try json_writer.write(json_schema_version);
+    try json_writer.objectField("evals");
+    try json_writer.beginArray();
+    for (reports) |report| {
+        try writeEvalReportJson(&json_writer, report);
+    }
+    try json_writer.endArray();
+    try json_writer.endObject();
 }
 
 pub fn formatEvalReport(writer: anytype, report: EvalReport) !void {
@@ -120,6 +158,111 @@ fn formatStatsLine(
             stats.latency.p95_ms,
         },
     );
+}
+
+fn writeRunResultJson(json_writer: *std.json.Stringify, result: runner.RunResult) !void {
+    try json_writer.beginObject();
+    try json_writer.objectField("group");
+    try json_writer.write(result.group);
+    try json_writer.objectField("eval_id");
+    try json_writer.write(result.eval_id);
+    try json_writer.objectField("service_name");
+    try json_writer.write(result.service_name);
+    try json_writer.objectField("model");
+    try json_writer.write(result.model);
+    try json_writer.objectField("run_index");
+    try json_writer.write(result.run_index);
+    try json_writer.objectField("case_id");
+    try json_writer.write(result.case_id);
+    try json_writer.objectField("output");
+    try json_writer.write(result.output);
+    try json_writer.objectField("passed");
+    try json_writer.write(result.passed);
+    try json_writer.objectField("score");
+    try json_writer.write(result.score);
+    try json_writer.objectField("failure_reason");
+    if (result.failure_reason) |reason| {
+        try json_writer.write(reason);
+    } else {
+        try json_writer.write(@as(?[]const u8, null));
+    }
+    try json_writer.objectField("latency_ms");
+    try json_writer.write(result.latency_ms);
+    try json_writer.endObject();
+}
+
+fn writeEvalReportJson(json_writer: *std.json.Stringify, report: EvalReport) !void {
+    try json_writer.beginObject();
+    try json_writer.objectField("group");
+    try json_writer.write(report.group);
+    try json_writer.objectField("eval_id");
+    try json_writer.write(report.eval_id);
+    try json_writer.objectField("stats");
+    try writeAggregateStatsJson(json_writer, report.stats);
+    try json_writer.objectField("services");
+    try json_writer.beginArray();
+    for (report.services) |service| {
+        try writeServiceReportJson(json_writer, service);
+    }
+    try json_writer.endArray();
+    try json_writer.endObject();
+}
+
+fn writeServiceReportJson(json_writer: *std.json.Stringify, report: ServiceReport) !void {
+    try json_writer.beginObject();
+    try json_writer.objectField("service_name");
+    try json_writer.write(report.service_name);
+    try json_writer.objectField("stats");
+    try writeAggregateStatsJson(json_writer, report.stats);
+    try json_writer.objectField("models");
+    try json_writer.beginArray();
+    for (report.models) |model| {
+        try writeModelReportJson(json_writer, model);
+    }
+    try json_writer.endArray();
+    try json_writer.endObject();
+}
+
+fn writeModelReportJson(json_writer: *std.json.Stringify, report: ModelReport) !void {
+    try json_writer.beginObject();
+    try json_writer.objectField("model");
+    try json_writer.write(report.model);
+    try json_writer.objectField("stats");
+    try writeAggregateStatsJson(json_writer, report.stats);
+    try json_writer.endObject();
+}
+
+fn writeAggregateStatsJson(json_writer: *std.json.Stringify, stats: AggregateStats) !void {
+    try json_writer.beginObject();
+    try json_writer.objectField("counts");
+    try writeAggregateCountsJson(json_writer, stats.counts);
+    try json_writer.objectField("pass_rate");
+    try json_writer.write(stats.pass_rate);
+    try json_writer.objectField("latency");
+    try writeLatencyStatsJson(json_writer, stats.latency);
+    try json_writer.endObject();
+}
+
+fn writeAggregateCountsJson(json_writer: *std.json.Stringify, counts: AggregateCounts) !void {
+    try json_writer.beginObject();
+    try json_writer.objectField("total_runs");
+    try json_writer.write(counts.total_runs);
+    try json_writer.objectField("passed");
+    try json_writer.write(counts.passed);
+    try json_writer.objectField("failed");
+    try json_writer.write(counts.failed);
+    try json_writer.endObject();
+}
+
+fn writeLatencyStatsJson(json_writer: *std.json.Stringify, stats: LatencyStats) !void {
+    try json_writer.beginObject();
+    try json_writer.objectField("mean_ms");
+    try json_writer.write(stats.mean_ms);
+    try json_writer.objectField("p50_ms");
+    try json_writer.write(stats.p50_ms);
+    try json_writer.objectField("p95_ms");
+    try json_writer.write(stats.p95_ms);
+    try json_writer.endObject();
 }
 
 const Accumulator = struct {
@@ -531,4 +674,66 @@ test "formatEvalReports includes report fields" {
     try std.testing.expect(std.mem.indexOf(u8, text, "mean_ms") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "p50_ms") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "p95_ms") != null);
+}
+
+test "formatRunResultsJson writes machine readable run artifacts" {
+    const results = [_]runner.RunResult{
+        sampleRun("smoke", "reply_ok", "product-api", "model-a", true, 10),
+        sampleRun("smoke", "reply_ok", "product-api", "model-a", false, 30),
+    };
+
+    var out = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer out.deinit();
+
+    try formatRunResultsJson(&out.writer, results[0..]);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, out.written(), .{});
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+    try std.testing.expectEqual(@as(i64, json_schema_version), root.get("schema_version").?.integer);
+
+    const runs = root.get("runs").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), runs.len);
+    try std.testing.expectEqualStrings("reply_ok", runs[0].object.get("eval_id").?.string);
+    try std.testing.expectEqualStrings("product-api", runs[0].object.get("service_name").?.string);
+    try std.testing.expect(runs[0].object.get("passed").?.bool);
+    try std.testing.expectEqual(@as(i64, 30), runs[1].object.get("latency_ms").?.integer);
+    try std.testing.expectEqualStrings("failed", runs[1].object.get("failure_reason").?.string);
+}
+
+test "formatEvalReportsJson writes grouped aggregate artifacts" {
+    const results = [_]runner.RunResult{
+        sampleRun("smoke", "reply_ok", "product-api", "model-a", true, 10),
+        sampleRun("smoke", "reply_ok", "product-api", "model-a", false, 30),
+    };
+
+    var owned = try aggregateRunResults(std.testing.allocator, results[0..]);
+    defer owned.deinit();
+
+    var out = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer out.deinit();
+
+    try formatEvalReportsJson(&out.writer, owned.items);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, out.written(), .{});
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+    try std.testing.expectEqual(@as(i64, json_schema_version), root.get("schema_version").?.integer);
+
+    const evals = root.get("evals").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), evals.len);
+
+    const eval_report = evals[0].object;
+    try std.testing.expectEqualStrings("smoke", eval_report.get("group").?.string);
+    try std.testing.expectEqualStrings("reply_ok", eval_report.get("eval_id").?.string);
+    try std.testing.expectEqual(@as(i64, 2), eval_report.get("stats").?.object.get("counts").?.object.get("total_runs").?.integer);
+
+    const service_reports = eval_report.get("services").?.array.items;
+    try std.testing.expectEqualStrings("product-api", service_reports[0].object.get("service_name").?.string);
+
+    const model_reports = service_reports[0].object.get("models").?.array.items;
+    try std.testing.expectEqualStrings("model-a", model_reports[0].object.get("model").?.string);
+    try std.testing.expectEqual(@as(i64, 30), model_reports[0].object.get("stats").?.object.get("latency").?.object.get("p95_ms").?.integer);
 }

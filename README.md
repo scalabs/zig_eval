@@ -17,8 +17,10 @@ models.
   field checks.
 - Call an OpenAI-compatible `POST /v1/chat/completions` endpoint.
 - Support authenticated and unauthenticated product endpoints.
+- Run grouped eval definitions across configured services and datasets.
+- Aggregate results into plain-text and JSON report artifacts.
 
-Runner orchestration, scoring, and CLI execution are planned follow-up work.
+Matcher scoring and CLI execution are planned follow-up work.
 
 ## Registry Layout
 
