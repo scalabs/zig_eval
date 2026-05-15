@@ -626,3 +626,21 @@ test "parseChatCompletionResponse rejects malformed success payload" {
         parseChatCompletionResponse(std.testing.allocator, .ok, raw_missing_content, "fallback-model"),
     );
 }
+
+test "example services registry loads" {
+    var cwd = try std.fs.cwd().openDir(".", .{});
+    defer cwd.close();
+
+    var loaded = try loadServices(
+        std.testing.allocator,
+        cwd,
+        "examples/registry/services.json",
+    );
+    defer loaded.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), loaded.items.len);
+    try std.testing.expectEqualStrings("local-product", loaded.items[0].name);
+    try std.testing.expect(loaded.items[0].api_key_env == null);
+    try std.testing.expectEqualStrings("product-staging", loaded.items[1].name);
+    try std.testing.expectEqualStrings("PRODUCT_STAGING_API_KEY", loaded.items[1].api_key_env.?);
+}

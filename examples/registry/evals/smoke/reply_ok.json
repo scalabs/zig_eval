@@ -1,0 +1,14 @@
+{
+  "id": "smoke.reply_ok",
+  "group": "smoke",
+  "description": "Checks that a service can return a simple literal response.",
+  "dataset_path": "examples/registry/data/smoke/reply_ok/test.jsonl",
+  "split": "test",
+  "matcher": {
+    "kind": "exact_match",
+    "case_sensitive": true,
+    "trim_whitespace": true
+  },
+  "default_run_count": 1,
+  "service_allowlist": ["local-product", "product-staging"]
+}

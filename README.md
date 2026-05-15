@@ -24,6 +24,8 @@ Matcher scoring and CLI execution are planned follow-up work.
 
 ## Registry Layout
 
+The repository includes a starter registry under `examples/registry`.
+
 ```text
 registry
 ├── services.json
@@ -91,6 +93,16 @@ Datasets are JSONL files. Each line is one eval case.
 {"id":"case-1","input":"Reply with exactly OK.","ideal":"OK"}
 {"id":"case-2","input":"Reply with exactly READY.","ideal":"READY"}
 ```
+
+## Example Registry
+
+Use `examples/registry` as a copyable starting point for a product eval suite.
+It includes:
+
+- one unauthenticated local product service
+- one authenticated staging product service
+- one smoke eval using `exact_match`
+- one structured-output eval using `json_fields`
 
 ## Design Direction
 

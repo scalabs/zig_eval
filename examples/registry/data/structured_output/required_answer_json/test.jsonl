@@ -1,0 +1,2 @@
+{"id":"case-1","input":"Return a JSON object with an answer field set to OK.","ideal":"{\"answer\":\"OK\"}"}
+{"id":"case-2","input":"Return a JSON object with an answer field set to READY.","ideal":"{\"answer\":\"READY\"}"}

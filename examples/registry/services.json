@@ -1,0 +1,17 @@
+[
+  {
+    "name": "local-product",
+    "base_url": "http://127.0.0.1:9000/v1/chat/completions",
+    "default_model": "local-eval-model",
+    "timeout_ms": 15000
+  },
+  {
+    "name": "product-staging",
+    "base_url": "https://product.example.com/v1/chat/completions",
+    "api_key_env": "PRODUCT_STAGING_API_KEY",
+    "default_model": "product-model",
+    "provider": "product",
+    "system_prompt": "Follow the eval instructions exactly.",
+    "timeout_ms": 30000
+  }
+]

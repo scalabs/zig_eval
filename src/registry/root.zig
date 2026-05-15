@@ -542,3 +542,46 @@ test "loadEvalCases rejects malformed JSONL lines" {
         loadEvalCases(std.testing.allocator, tmp.dir, "registry/data/smoke/reply_ok/test.jsonl"),
     );
 }
+
+test "example eval registry loads definitions and datasets" {
+    var cwd = try std.fs.cwd().openDir(".", .{});
+    defer cwd.close();
+
+    var loaded = try loadAllEvalDefinitions(
+        std.testing.allocator,
+        cwd,
+        "examples/registry/evals",
+    );
+    defer loaded.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), loaded.items.len);
+
+    var saw_smoke = false;
+    var saw_structured_output = false;
+    var total_cases: usize = 0;
+
+    for (loaded.items) |definition| {
+        if (std.mem.eql(u8, definition.id, "smoke.reply_ok")) {
+            saw_smoke = true;
+            try std.testing.expect(definition.matcher == .exact_match);
+            try std.testing.expectEqual(@as(usize, 2), definition.service_allowlist.?.len);
+        }
+        if (std.mem.eql(u8, definition.id, "structured_output.required_answer_json")) {
+            saw_structured_output = true;
+            try std.testing.expect(definition.matcher == .json_fields);
+            try std.testing.expectEqualStrings("answer", definition.matcher.json_fields.required_fields[0]);
+        }
+
+        var cases = try loadEvalCases(
+            std.testing.allocator,
+            cwd,
+            definition.dataset_path,
+        );
+        defer cases.deinit();
+        total_cases += cases.items.len;
+    }
+
+    try std.testing.expect(saw_smoke);
+    try std.testing.expect(saw_structured_output);
+    try std.testing.expectEqual(@as(usize, 4), total_cases);
+}
