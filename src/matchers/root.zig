@@ -1,5 +1,7 @@
 const std = @import("std");
 
+pub const runner = @import("runner.zig");
+
 pub const MatcherKind = enum {
     exact_match,
     includes,
