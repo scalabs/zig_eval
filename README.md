@@ -22,6 +22,14 @@ models.
 
 Matcher scoring and CLI execution are planned follow-up work.
 
+## How It Works
+
+`zig_eval` loads services, eval definitions, and JSONL datasets from a registry,
+then the runner sends each eval case to each selected service. Raw run results
+can be aggregated into readable text reports or machine-readable JSON artifacts.
+
+See [docs/usage.md](docs/usage.md) for a complete library usage example.
+
 ## Registry Layout
 
 The repository includes a starter registry under `examples/registry`.
