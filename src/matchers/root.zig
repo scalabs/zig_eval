@@ -21,6 +21,12 @@ pub const MatcherConfig = union(MatcherKind) {
     json_fields: JsonFieldsMatcherConfig,
 };
 
+pub const MatchOutcome = struct {
+    passed: bool,
+    score: f64,
+    failure_reason: ?[]const u8 = null,
+};
+
 pub fn parseMatcherConfig(
     allocator: std.mem.Allocator,
     value: std.json.Value,
@@ -65,6 +71,109 @@ pub fn parseMatcherConfig(
     }
 
     return error.InvalidMatcherConfig;
+}
+
+pub fn evaluate(
+    allocator: std.mem.Allocator,
+    matcher: MatcherConfig,
+    output: []const u8,
+    ideal: ?[]const u8,
+) !MatchOutcome {
+    return switch (matcher) {
+        .exact_match => |options| evaluateExactMatch(options, output, ideal),
+        .includes => |options| evaluateIncludes(options, output, ideal),
+        .json_fields => |config| evaluateJsonFields(allocator, config, output),
+    };
+}
+
+fn evaluateExactMatch(
+    options: TextMatchOptions,
+    output: []const u8,
+    ideal: ?[]const u8,
+) MatchOutcome {
+    const expected = ideal orelse return failed("missing ideal");
+    const normalized_output = normalizeText(output, options);
+    const normalized_expected = normalizeText(expected, options);
+    if (textEquals(normalized_output, normalized_expected, options.case_sensitive)) {
+        return passed();
+    }
+    return failed("output did not exactly match ideal");
+}
+
+fn evaluateIncludes(
+    options: TextMatchOptions,
+    output: []const u8,
+    ideal: ?[]const u8,
+) MatchOutcome {
+    const expected = ideal orelse return failed("missing ideal");
+    const normalized_output = normalizeText(output, options);
+    const normalized_expected = normalizeText(expected, options);
+    if (textContains(normalized_output, normalized_expected, options.case_sensitive)) {
+        return passed();
+    }
+    return failed("output did not include ideal");
+}
+
+fn evaluateJsonFields(
+    allocator: std.mem.Allocator,
+    config: JsonFieldsMatcherConfig,
+    output: []const u8,
+) !MatchOutcome {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, output, .{}) catch {
+        return failed("invalid json output");
+    };
+    defer parsed.deinit();
+
+    const object = switch (parsed.value) {
+        .object => |object| object,
+        else => return failed("json output is not an object"),
+    };
+
+    for (config.required_fields) |field| {
+        if (object.get(field) == null) return failed("missing required json field");
+    }
+    return passed();
+}
+
+fn normalizeText(text: []const u8, options: TextMatchOptions) []const u8 {
+    if (!options.trim_whitespace) return text;
+    return std.mem.trim(u8, text, " \t\r\n");
+}
+
+fn textEquals(a: []const u8, b: []const u8, case_sensitive: bool) bool {
+    if (case_sensitive) return std.mem.eql(u8, a, b);
+    if (a.len != b.len) return false;
+    for (a, b) |a_char, b_char| {
+        if (std.ascii.toLower(a_char) != std.ascii.toLower(b_char)) return false;
+    }
+    return true;
+}
+
+fn textContains(haystack: []const u8, needle: []const u8, case_sensitive: bool) bool {
+    if (case_sensitive) return std.mem.indexOf(u8, haystack, needle) != null;
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+
+    var index: usize = 0;
+    while (index <= haystack.len - needle.len) : (index += 1) {
+        if (textEquals(haystack[index .. index + needle.len], needle, false)) return true;
+    }
+    return false;
+}
+
+fn passed() MatchOutcome {
+    return .{
+        .passed = true,
+        .score = 1.0,
+    };
+}
+
+fn failed(reason: []const u8) MatchOutcome {
+    return .{
+        .passed = false,
+        .score = 0.0,
+        .failure_reason = reason,
+    };
 }
 
 fn validateFields(
@@ -201,4 +310,95 @@ test "parseMatcherConfig rejects unknown kinds" {
         error.InvalidMatcherConfig,
         parseMatcherConfig(arena.allocator(), parsed.value),
     );
+}
+
+test "evaluate exact_match passes with trimming" {
+    const outcome = try evaluate(
+        std.testing.allocator,
+        .{ .exact_match = .{ .case_sensitive = true, .trim_whitespace = true } },
+        " OK\n",
+        "OK",
+    );
+
+    try std.testing.expect(outcome.passed);
+    try std.testing.expectEqual(@as(f64, 1.0), outcome.score);
+}
+
+test "evaluate exact_match honors case sensitivity" {
+    const sensitive = try evaluate(
+        std.testing.allocator,
+        .{ .exact_match = .{ .case_sensitive = true, .trim_whitespace = true } },
+        "ok",
+        "OK",
+    );
+    const insensitive = try evaluate(
+        std.testing.allocator,
+        .{ .exact_match = .{ .case_sensitive = false, .trim_whitespace = true } },
+        "ok",
+        "OK",
+    );
+
+    try std.testing.expect(!sensitive.passed);
+    try std.testing.expect(insensitive.passed);
+}
+
+test "evaluate includes honors case and trimming options" {
+    const outcome = try evaluate(
+        std.testing.allocator,
+        .{ .includes = .{ .case_sensitive = false, .trim_whitespace = true } },
+        "  Product is READY.  ",
+        "ready",
+    );
+
+    try std.testing.expect(outcome.passed);
+}
+
+test "evaluate text matchers fail with missing ideal" {
+    const outcome = try evaluate(
+        std.testing.allocator,
+        .{ .exact_match = .{} },
+        "OK",
+        null,
+    );
+
+    try std.testing.expect(!outcome.passed);
+    try std.testing.expectEqualStrings("missing ideal", outcome.failure_reason.?);
+}
+
+test "evaluate json_fields passes when required fields exist" {
+    const fields = [_][]const u8{ "answer", "score" };
+    const outcome = try evaluate(
+        std.testing.allocator,
+        .{ .json_fields = .{ .required_fields = fields[0..] } },
+        "{\"answer\":\"OK\",\"score\":1}",
+        null,
+    );
+
+    try std.testing.expect(outcome.passed);
+}
+
+test "evaluate json_fields fails for invalid JSON" {
+    const fields = [_][]const u8{"answer"};
+    const outcome = try evaluate(
+        std.testing.allocator,
+        .{ .json_fields = .{ .required_fields = fields[0..] } },
+        "not json",
+        null,
+    );
+
+    try std.testing.expect(!outcome.passed);
+    try std.testing.expectEqualStrings("invalid json output", outcome.failure_reason.?);
+}
+
+test "evaluate json_fields fails when required field is missing" {
+    const fields = [_][]const u8{ "answer", "score" };
+    const outcome = try evaluate(
+        std.testing.allocator,
+        .{ .json_fields = .{ .required_fields = fields[0..] } },
+        "{\"answer\":\"OK\"}",
+        null,
+    );
+
+    try std.testing.expect(!outcome.passed);
+    try std.testing.expectEqualStrings("missing required json field", outcome.failure_reason.?);
 }
