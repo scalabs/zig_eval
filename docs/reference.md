@@ -63,8 +63,14 @@ Each eval definition describes one eval and points to one JSONL dataset.
 | `default_run_count` | yes | Number of times each case should run by default. |
 | `service_allowlist` | no | Service names allowed for this eval. |
 
-Supported matcher config kinds are currently `exact_match`, `includes`, and
-`json_fields`.
+Supported matcher config kinds:
+
+- `exact_match`: compares output with `ideal`, with optional case sensitivity
+  and whitespace trimming.
+- `includes`: checks whether output contains `ideal`, with optional case
+  sensitivity and whitespace trimming.
+- `json_fields`: checks that the output is a JSON object containing configured
+  root-level fields.
 
 ## Dataset Case
 

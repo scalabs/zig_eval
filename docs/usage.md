@@ -1,8 +1,8 @@
 # Running Product Evals With `zig_eval`
 
-`zig_eval` is a library-first eval framework. The CLI entrypoint exists, but
-full CLI execution is not implemented yet. For now, product evals are wired from
-Zig code using the registry, service, runner, and reporting modules.
+`zig_eval` is a registry-driven eval tool and library. V1 supports deterministic
+matchers, OpenAI-compatible chat-completions services, CLI execution, and text
+or JSON report output.
 
 ## Flow
 
@@ -10,7 +10,7 @@ Zig code using the registry, service, runner, and reporting modules.
 services.json
     -> eval definition JSON files
     -> JSONL datasets
-    -> runner
+    -> zig_eval list/run
     -> raw run results
     -> text or JSON reports
 ```
@@ -35,7 +35,9 @@ authentication.
 
 Eval definitions live under `examples/registry/evals`.
 
-Each eval definition points to one dataset and one matcher config:
+Each eval definition points to one dataset and one matcher config. Dataset
+paths are relative to the registry root when using the CLI or registry-root
+loaders.
 
 ```json
 {
@@ -67,11 +69,45 @@ case with an input prompt and optional expected value.
 {"id":"case-2","input":"Reply with exactly READY.","ideal":"READY"}
 ```
 
-## 4. Wire The Library From Zig
+`exact_match` and `includes` use `ideal`. `json_fields` checks the service
+output for configured root-level JSON fields.
 
-The runner requires a matcher adapter. This is intentional: matcher scoring is
-still pending teammate work, so current integrations should provide an adapter
-that calls the final matcher API once it exists.
+## 4. Run From The CLI
+
+List services and evals:
+
+```sh
+zig build run -- list --registry examples/registry
+```
+
+Run evals with the default text report:
+
+```sh
+zig build run -- run --registry examples/registry --service local-product
+```
+
+Run one eval and write aggregate JSON to stdout:
+
+```sh
+zig build run -- run --registry examples/registry --service local-product --eval smoke.reply_ok --format json
+```
+
+Supported flags:
+
+- `--registry PATH`: registry root, default `examples/registry`
+- `--service NAME`: run only one service
+- `--group GROUP`: run only one eval group
+- `--eval ID`: run only one eval id
+- `--runs N`: override each eval's `default_run_count`
+- `--format text|json`: report format, default `text`
+
+`run` requires the selected service endpoint to be reachable and compatible
+with OpenAI-style chat completions.
+
+## 5. Wire The Library From Zig
+
+The CLI is the easiest path, but library users can still call the same modules
+directly.
 
 ```zig
 const std = @import("std");
@@ -83,35 +119,33 @@ fn evaluateMatcher(
     output: []const u8,
     ideal: ?[]const u8,
 ) anyerror!zig_eval.runner.MatcherOutcome {
-    _ = allocator;
-    _ = matcher;
-    _ = output;
-    _ = ideal;
-
-    // Replace this with the real matcher implementation.
-    return error.MatcherNotImplemented;
+    const outcome = try zig_eval.matchers.evaluate(allocator, matcher, output, ideal);
+    return .{
+        .passed = outcome.passed,
+        .score = outcome.score,
+        .failure_reason = outcome.failure_reason,
+    };
 }
 
 pub fn runProductEvals(allocator: std.mem.Allocator) !void {
-    var cwd = try std.fs.cwd().openDir(".", .{});
-    defer cwd.close();
+    var registry_dir = try std.fs.cwd().openDir("examples/registry", .{});
+    defer registry_dir.close();
 
     var loaded_services = try zig_eval.services.loadServices(
         allocator,
-        cwd,
-        "examples/registry/services.json",
+        registry_dir,
+        "services.json",
     );
     defer loaded_services.deinit();
 
-    var loaded_evals = try zig_eval.registry.loadAllEvalDefinitions(
+    var loaded_evals = try zig_eval.registry.loadRegistryEvalDefinitions(
         allocator,
-        cwd,
-        "examples/registry/evals",
+        registry_dir,
     );
     defer loaded_evals.deinit();
 
     var runner_result = try zig_eval.runner.runEvaluations(allocator, .{
-        .root_dir = cwd,
+        .root_dir = registry_dir,
         .services = loaded_services.items,
         .evals = loaded_evals.items,
         .matcher_evaluator = evaluateMatcher,
@@ -127,17 +161,12 @@ pub fn runProductEvals(allocator: std.mem.Allocator) !void {
     var text_out = std.Io.Writer.Allocating.init(allocator);
     defer text_out.deinit();
     try zig_eval.reporting.formatEvalReports(&text_out.writer, reports.items);
-
-    var json_out = std.Io.Writer.Allocating.init(allocator);
-    defer json_out.deinit();
-    try zig_eval.reporting.formatEvalReportsJson(&json_out.writer, reports.items);
 }
 ```
 
 ## Current Limitations
 
-- CLI execution is not implemented yet.
-- Matcher scoring is still pending teammate work.
 - Service calls must target an OpenAI-compatible chat-completions endpoint.
-- Streaming, tool-calling, multimodal evals, and model-graded evals are out of
-  scope for the current implementation.
+- JSON field matching checks root-level fields only.
+- Streaming, tool-calling, multimodal evals, model-graded evals, retries, and
+  advanced significance testing are out of scope for v1.

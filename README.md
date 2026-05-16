@@ -13,14 +13,13 @@ models.
 - Load service definitions from JSON.
 - Load grouped eval definitions from a registry directory.
 - Load eval cases from JSONL datasets.
-- Parse matcher configuration for exact-match, includes, and required JSON
-  field checks.
+- Evaluate exact-match, includes, and required JSON field checks.
 - Call an OpenAI-compatible `POST /v1/chat/completions` endpoint.
 - Support authenticated and unauthenticated product endpoints.
 - Run grouped eval definitions across configured services and datasets.
 - Aggregate results into plain-text and JSON report artifacts.
-
-Matcher scoring and CLI execution are planned follow-up work.
+- Run evals from the `zig_eval` CLI with service, group, eval, run-count, and
+  output-format filters.
 
 ## How It Works
 
@@ -31,6 +30,28 @@ can be aggregated into readable text reports or machine-readable JSON artifacts.
 See [docs/usage.md](docs/usage.md) for a complete library usage example.
 See [docs/reference.md](docs/reference.md) for registry and report field
 definitions.
+
+## Quick Start
+
+List the example registry:
+
+```sh
+zig build run -- list --registry examples/registry
+```
+
+Run one eval against one configured service:
+
+```sh
+zig build run -- run --registry examples/registry --service local-product --eval smoke.reply_ok
+```
+
+Use JSON report output:
+
+```sh
+zig build run -- run --registry examples/registry --service local-product --format json
+```
+
+`run` requires the selected service endpoint to be reachable.
 
 ## Registry Layout
 
