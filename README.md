@@ -83,7 +83,7 @@ Each eval definition points to a dataset and one matcher.
   "id": "smoke.reply_ok",
   "group": "smoke",
   "description": "Checks that the service can return a simple literal answer.",
-  "dataset_path": "registry/data/smoke/reply_ok/test.jsonl",
+  "dataset_path": "data/smoke/reply_ok/test.jsonl",
   "split": "test",
   "matcher": {
     "kind": "exact_match",

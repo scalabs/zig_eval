@@ -117,6 +117,21 @@ pub fn loadAllEvalDefinitions(
     };
 }
 
+pub fn loadRegistryEvalDefinitions(
+    allocator: std.mem.Allocator,
+    registry_dir: std.fs.Dir,
+) !LoadedEvalDefinitions {
+    return loadAllEvalDefinitions(allocator, registry_dir, "evals");
+}
+
+pub fn loadRegistryEvalCases(
+    allocator: std.mem.Allocator,
+    registry_dir: std.fs.Dir,
+    definition: EvalDefinition,
+) !LoadedEvalCases {
+    return loadEvalCases(allocator, registry_dir, definition.dataset_path);
+}
+
 pub fn loadEvalCases(
     allocator: std.mem.Allocator,
     dir: std.fs.Dir,
@@ -544,13 +559,12 @@ test "loadEvalCases rejects malformed JSONL lines" {
 }
 
 test "example eval registry loads definitions and datasets" {
-    var cwd = try std.fs.cwd().openDir(".", .{});
-    defer cwd.close();
+    var registry_dir = try std.fs.cwd().openDir("examples/registry", .{});
+    defer registry_dir.close();
 
-    var loaded = try loadAllEvalDefinitions(
+    var loaded = try loadRegistryEvalDefinitions(
         std.testing.allocator,
-        cwd,
-        "examples/registry/evals",
+        registry_dir,
     );
     defer loaded.deinit();
 
@@ -564,6 +578,7 @@ test "example eval registry loads definitions and datasets" {
         if (std.mem.eql(u8, definition.id, "smoke.reply_ok")) {
             saw_smoke = true;
             try std.testing.expect(definition.matcher == .exact_match);
+            try std.testing.expectEqualStrings("data/smoke/reply_ok/test.jsonl", definition.dataset_path);
             try std.testing.expectEqual(@as(usize, 2), definition.service_allowlist.?.len);
         }
         if (std.mem.eql(u8, definition.id, "structured_output.required_answer_json")) {
@@ -572,10 +587,10 @@ test "example eval registry loads definitions and datasets" {
             try std.testing.expectEqualStrings("answer", definition.matcher.json_fields.required_fields[0]);
         }
 
-        var cases = try loadEvalCases(
+        var cases = try loadRegistryEvalCases(
             std.testing.allocator,
-            cwd,
-            definition.dataset_path,
+            registry_dir,
+            definition,
         );
         defer cases.deinit();
         total_cases += cases.items.len;

@@ -2,7 +2,7 @@
   "id": "structured_output.required_answer_json",
   "group": "structured_output",
   "description": "Checks that a service can return JSON containing an answer field.",
-  "dataset_path": "examples/registry/data/structured_output/required_answer_json/test.jsonl",
+  "dataset_path": "data/structured_output/required_answer_json/test.jsonl",
   "split": "test",
   "matcher": {
     "kind": "json_fields",

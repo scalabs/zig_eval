@@ -57,7 +57,7 @@ Each eval definition describes one eval and points to one JSONL dataset.
 | `id` | yes | Unique eval id, usually `<group>.<name>`. |
 | `group` | yes | Capability group used for filtering and reporting. |
 | `description` | yes | Human-readable eval purpose. |
-| `dataset_path` | yes | Path to the dataset JSONL file. |
+| `dataset_path` | yes | Path to the dataset JSONL file, relative to the registry root when using registry-root loading. |
 | `split` | yes | Dataset split name, such as `test`. |
 | `matcher` | yes | Matcher configuration parsed by `matchers.parseMatcherConfig`. |
 | `default_run_count` | yes | Number of times each case should run by default. |
