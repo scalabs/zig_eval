@@ -29,6 +29,8 @@ then the runner sends each eval case to each selected service. Raw run results
 can be aggregated into readable text reports or machine-readable JSON artifacts.
 
 See [docs/usage.md](docs/usage.md) for a complete library usage example.
+See [docs/reference.md](docs/reference.md) for registry and report field
+definitions.
 
 ## Registry Layout
 
