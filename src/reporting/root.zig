@@ -314,8 +314,8 @@ const Accumulator = struct {
             .pass_rate = passRate(self.counts),
             .latency = try computeLatencyStats(allocator, self.latencies.items),
             .retries = .{
-                         .retried_runs = self.retried_runs,
-                         .total_attempts = self.total_attempts,
+                .retried_runs = self.retried_runs,
+                .total_attempts = self.total_attempts,
             },
         };
     }
@@ -591,8 +591,8 @@ test "EvalReport stores grouped report shapes" {
                     .p95_ms = 140,
                 },
                 .retries = .{
-                            .retried_runs = 1,
-                            .total_attempts = 11,
+                    .retried_runs = 1,
+                    .total_attempts = 11,
                 },
             },
         },

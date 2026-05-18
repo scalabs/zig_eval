@@ -2,6 +2,8 @@ const std = @import("std");
 const matchers = @import("../matchers/root.zig");
 const registry = @import("../registry/root.zig");
 const services = @import("../services/root.zig");
+const Thread = std.Thread;
+const Mutex = Thread.Mutex;
 
 pub const RunResult = struct {
     group: []const u8,
@@ -46,6 +48,7 @@ pub const RunnerOptions = struct {
     group_filter: ?[]const u8 = null,
     eval_filter: ?[]const u8 = null,
     run_count_override: ?u32 = null,
+    parallelism: u32 = 1,
     service_caller: ServiceCaller = defaultServiceCaller,
     matcher_evaluator: MatcherEvaluator,
 };
@@ -62,6 +65,24 @@ pub const RunnerResult = struct {
     }
 };
 
+pub const EvalTask = struct {
+    eval_definition: registry.EvalDefinition,
+    service: services.ServiceConfig,
+    case: registry.EvalCase,
+    run_index: u32,
+};
+
+pub const WorkerContext = struct {
+    allocator: std.mem.Allocator,
+    arena_allocator: std.mem.Allocator,
+    runs: *std.ArrayList(RunResult),
+    runs_mutex: *Mutex,
+    tasks: []const EvalTask,
+    next_index: *usize,
+    index_mutex: *Mutex,
+    options: RunnerOptions,
+};
+
 pub fn runEvaluations(
     allocator: std.mem.Allocator,
     options: RunnerOptions,
@@ -74,33 +95,50 @@ pub fn runEvaluations(
     var runs = std.ArrayList(RunResult){};
     defer runs.deinit(allocator);
 
-    for (options.evals) |eval_definition| {
-        if (!evalMatchesFilters(eval_definition, options)) continue;
+    var tasks = try collectEvalTasks(allocator, arena.allocator(), options);
+    defer tasks.deinit(allocator);
 
-        const run_count = options.run_count_override orelse eval_definition.default_run_count;
-        if (run_count == 0) return error.InvalidRunCount;
+    if (options.parallelism <= 1) {
+        for (tasks.items) |task| {
+            try runOneCase(
+                allocator,
+                arena.allocator(),
+                &runs,
+                options,
+                task.eval_definition,
+                task.service,
+                task.case,
+                task.run_index,
+            );
+        }
+    } else {
+        var runs_mutex = Mutex{};
+        var index_mutex = Mutex{};
+        var next_index: usize = 0;
 
-        var cases = try registry.loadEvalCases(allocator, options.root_dir, eval_definition.dataset_path);
-        defer cases.deinit();
+        const worker_count = @min(options.parallelism, @as(u32, @intCast(tasks.items.len)));
 
-        for (options.services) |service| {
-            if (!serviceMatchesFilters(service, eval_definition, options)) continue;
+        const threads = try allocator.alloc(Thread, worker_count);
+        defer allocator.free(threads);
 
-            var run_index: u32 = 1;
-            while (run_index <= run_count) : (run_index += 1) {
-                for (cases.items) |case| {
-                    try runOneCase(
-                        allocator,
-                        arena.allocator(),
-                        &runs,
-                        options,
-                        eval_definition,
-                        service,
-                        case,
-                        run_index,
-                    );
-                }
-            }
+        var context = WorkerContext{
+            .allocator = allocator,
+            .arena_allocator = arena.allocator(),
+            .runs = &runs,
+            .runs_mutex = &runs_mutex,
+            .tasks = tasks.items,
+            .next_index = &next_index,
+            .index_mutex = &index_mutex,
+            .options = options,
+        };
+
+        for (threads, 0..) |*thread, index| {
+            _ = index;
+            thread.* = try Thread.spawn(.{}, workerLoop, .{&context});
+        }
+
+        for (threads) |thread| {
+            thread.join();
         }
     }
 
@@ -109,6 +147,80 @@ pub fn runEvaluations(
         .arena = arena,
         .runs = try arena.allocator().dupe(RunResult, runs.items),
     };
+}
+
+fn workerLoop(context: *WorkerContext) !void {
+    while (true) {
+        context.index_mutex.lock();
+        const index = context.next_index.*;
+        if (index >= context.tasks.len) {
+            context.index_mutex.unlock();
+            return;
+        }
+
+        context.next_index.* += 1;
+        context.index_mutex.unlock();
+
+        const task = context.tasks[index];
+
+        context.runs_mutex.lock();
+        defer context.runs_mutex.unlock();
+
+        try runOneCase(
+            context.allocator,
+            context.arena_allocator,
+            context.runs,
+            context.options,
+            task.eval_definition,
+            task.service,
+            task.case,
+            task.run_index,
+        );
+    }
+}
+
+fn collectEvalTasks(
+    allocator: std.mem.Allocator,
+    arena_allocator: std.mem.Allocator,
+    options: RunnerOptions,
+) !std.ArrayList(EvalTask) {
+    var tasks = std.ArrayList(EvalTask){};
+
+    for (options.evals) |eval_definition| {
+        if (!evalMatchesFilters(eval_definition, options)) continue;
+
+        const run_count = options.run_count_override orelse eval_definition.default_run_count;
+        if (run_count == 0) return error.InvalidRunCount;
+
+        var cases = try registry.loadEvalCases(
+            allocator,
+            options.root_dir,
+            eval_definition.dataset_path,
+        );
+        defer cases.deinit();
+
+        for (options.services) |service| {
+            if (!serviceMatchesFilters(service, eval_definition, options)) continue;
+
+            var run_index: u32 = 1;
+            while (run_index <= run_count) : (run_index += 1) {
+                for (cases.items) |case| {
+                    try tasks.append(allocator, .{
+                        .eval_definition = eval_definition,
+                        .service = service,
+                        .case = .{
+                            .id = try arena_allocator.dupe(u8, case.id),
+                            .input = try arena_allocator.dupe(u8, case.input),
+                            .ideal = if (case.ideal) |ideal| try arena_allocator.dupe(u8, ideal) else null,
+                        },
+                        .run_index = run_index,
+                    });
+                }
+            }
+        }
+    }
+
+    return tasks;
 }
 
 fn runOneCase(

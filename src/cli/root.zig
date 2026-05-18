@@ -22,6 +22,7 @@ pub const CliOptions = struct {
     group_filter: ?[]const u8 = null,
     eval_filter: ?[]const u8 = null,
     run_count_override: ?u32 = null,
+    parallelism: u32 = 1,
     format: OutputFormat = .text,
 };
 
@@ -88,7 +89,9 @@ pub fn parseArgs(args: []const []const u8) !CliOptions {
         } else if (std.mem.eql(u8, arg, "--eval")) {
             options.eval_filter = try nextValue(args, &index);
         } else if (std.mem.eql(u8, arg, "--runs")) {
-            options.run_count_override = try parseRunCount(try nextValue(args, &index));
+            options.run_count_override = try parsePositiveU32(try nextValue(args, &index));
+        } else if (std.mem.eql(u8, arg, "--parallel")) {
+            options.parallelism = try parsePositiveU32(try nextValue(args, &index));
         } else if (std.mem.eql(u8, arg, "--format")) {
             options.format = try parseFormat(try nextValue(args, &index));
         } else {
@@ -103,7 +106,7 @@ pub fn writeUsage(writer: *std.Io.Writer) !void {
     try writer.writeAll(
         \\Usage:
         \\  zig_eval list [--registry PATH]
-        \\  zig_eval run [--registry PATH] [--service NAME] [--group GROUP] [--eval ID] [--runs N] [--format text|json]
+        \\  zig_eval run [--registry PATH] [--service NAME] [--group GROUP] [--eval ID] [--runs N] [--parallel N] [--format text|json]
         \\
     );
 }
@@ -144,6 +147,7 @@ fn runRegistryEvals(
         .group_filter = options.group_filter,
         .eval_filter = options.eval_filter,
         .run_count_override = options.run_count_override,
+        .parallelism = options.parallelism,
         .service_caller = dependencies.service_caller,
         .matcher_evaluator = evaluateMatcher,
     });
@@ -192,7 +196,7 @@ fn parseFormat(value: []const u8) !OutputFormat {
     return error.InvalidArguments;
 }
 
-fn parseRunCount(value: []const u8) !u32 {
+fn parsePositiveU32(value: []const u8) !u32 {
     const parsed = std.fmt.parseInt(u32, value, 10) catch return error.InvalidArguments;
     if (parsed == 0) return error.InvalidArguments;
     return parsed;
@@ -227,6 +231,8 @@ test "parseArgs supports run filters and JSON output" {
         "smoke.reply_ok",
         "--runs",
         "2",
+        "--parallel",
+        "4",
         "--format",
         "json",
     });
@@ -237,6 +243,7 @@ test "parseArgs supports run filters and JSON output" {
     try std.testing.expectEqualStrings("smoke", options.group_filter.?);
     try std.testing.expectEqualStrings("smoke.reply_ok", options.eval_filter.?);
     try std.testing.expectEqual(@as(u32, 2), options.run_count_override.?);
+    try std.testing.expectEqual(@as(u32, 4), options.parallelism);
     try std.testing.expectEqual(OutputFormat.json, options.format);
 }
 
