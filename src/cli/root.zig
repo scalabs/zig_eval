@@ -23,6 +23,7 @@ pub const CliOptions = struct {
     eval_filter: ?[]const u8 = null,
     run_count_override: ?u32 = null,
     parallelism: u32 = 1,
+    max_inflight_per_service: u32 = 1,
     format: OutputFormat = .text,
 };
 
@@ -92,6 +93,8 @@ pub fn parseArgs(args: []const []const u8) !CliOptions {
             options.run_count_override = try parsePositiveU32(try nextValue(args, &index));
         } else if (std.mem.eql(u8, arg, "--parallel")) {
             options.parallelism = try parsePositiveU32(try nextValue(args, &index));
+        } else if (std.mem.eql(u8, arg, "--max-inflight-per-service")) {
+            options.max_inflight_per_service = try parsePositiveU32(try nextValue(args, &index));
         } else if (std.mem.eql(u8, arg, "--format")) {
             options.format = try parseFormat(try nextValue(args, &index));
         } else {
@@ -106,7 +109,7 @@ pub fn writeUsage(writer: *std.Io.Writer) !void {
     try writer.writeAll(
         \\Usage:
         \\  zig_eval list [--registry PATH]
-        \\  zig_eval run [--registry PATH] [--service NAME] [--group GROUP] [--eval ID] [--runs N] [--parallel N] [--format text|json]
+        \\  zig_eval run [--registry PATH] [--service NAME] [--group GROUP] [--eval ID] [--runs N] [--parallel N] [--max-inflight-per-service N] [--format text|json]
         \\
     );
 }
@@ -148,6 +151,7 @@ fn runRegistryEvals(
         .eval_filter = options.eval_filter,
         .run_count_override = options.run_count_override,
         .parallelism = options.parallelism,
+        .max_inflight_per_service = options.max_inflight_per_service,
         .service_caller = dependencies.service_caller,
         .matcher_evaluator = evaluateMatcher,
     });

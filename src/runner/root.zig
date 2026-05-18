@@ -49,6 +49,7 @@ pub const RunnerOptions = struct {
     eval_filter: ?[]const u8 = null,
     run_count_override: ?u32 = null,
     parallelism: u32 = 1,
+    max_inflight_per_service: u32 = 1,
     service_caller: ServiceCaller = defaultServiceCaller,
     matcher_evaluator: MatcherEvaluator,
 };
@@ -80,7 +81,56 @@ pub const WorkerContext = struct {
     tasks: []const EvalTask,
     next_index: *usize,
     index_mutex: *Mutex,
+    service_limiter: *ServiceLimiter,
     options: RunnerOptions,
+};
+
+pub const ServiceLimiter = struct {
+    mutex: Mutex = .{},
+    service_names: []const []const u8,
+    inflight_counts: []u32,
+    max_inflight: u32,
+
+    fn acquire(self: *ServiceLimiter, service_name: []const u8) void {
+        while (true) {
+            self.mutex.lock();
+
+            const index = self.indexOf(service_name) orelse {
+                self.mutex.unlock();
+                return;
+            };
+
+            if (self.inflight_counts[index] < self.max_inflight) {
+                self.inflight_counts[index] += 1;
+                self.mutex.unlock();
+                return;
+            }
+
+            self.mutex.unlock();
+            Thread.sleep(1 * std.time.ns_per_ms);
+        }
+    }
+
+    fn release(self: *ServiceLimiter, service_name: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const index = self.indexOf(service_name) orelse return;
+
+        if (self.inflight_counts[index] > 0) {
+            self.inflight_counts[index] -= 1;
+        }
+    }
+
+    fn indexOf(self: *ServiceLimiter, service_name: []const u8) ?usize {
+        for (self.service_names, 0..) |name, index| {
+            if (std.mem.eql(u8, name, service_name)) {
+                return index;
+            }
+        }
+
+        return null;
+    }
 };
 
 pub fn runEvaluations(
@@ -95,6 +145,8 @@ pub fn runEvaluations(
     var runs = std.ArrayList(RunResult){};
     defer runs.deinit(allocator);
 
+    var runs_mutex = Mutex{};
+
     var tasks = try collectEvalTasks(allocator, arena.allocator(), options);
     defer tasks.deinit(allocator);
 
@@ -104,6 +156,7 @@ pub fn runEvaluations(
                 allocator,
                 arena.allocator(),
                 &runs,
+                &runs_mutex,
                 options,
                 task.eval_definition,
                 task.service,
@@ -112,9 +165,24 @@ pub fn runEvaluations(
             );
         }
     } else {
-        var runs_mutex = Mutex{};
         var index_mutex = Mutex{};
         var next_index: usize = 0;
+        var service_names = try allocator.alloc([]const u8, options.services.len);
+        defer allocator.free(service_names);
+
+        var inflight_counts = try allocator.alloc(u32, options.services.len);
+        defer allocator.free(inflight_counts);
+
+        for (options.services, 0..) |service, index| {
+            service_names[index] = service.name;
+            inflight_counts[index] = 0;
+        }
+
+        var service_limiter = ServiceLimiter{
+            .service_names = service_names,
+            .inflight_counts = inflight_counts,
+            .max_inflight = options.max_inflight_per_service,
+        };
 
         const worker_count = @min(options.parallelism, @as(u32, @intCast(tasks.items.len)));
 
@@ -129,6 +197,7 @@ pub fn runEvaluations(
             .tasks = tasks.items,
             .next_index = &next_index,
             .index_mutex = &index_mutex,
+            .service_limiter = &service_limiter,
             .options = options,
         };
 
@@ -141,6 +210,8 @@ pub fn runEvaluations(
             thread.join();
         }
     }
+
+    std.mem.sort(RunResult, runs.items, {}, compareRunResults);
 
     return .{
         .parent_allocator = allocator,
@@ -162,14 +233,15 @@ fn workerLoop(context: *WorkerContext) !void {
         context.index_mutex.unlock();
 
         const task = context.tasks[index];
-
-        context.runs_mutex.lock();
-        defer context.runs_mutex.unlock();
+        
+        context.service_limiter.acquire(task.service.name);
+        defer context.service_limiter.release(task.service.name);
 
         try runOneCase(
             context.allocator,
             context.arena_allocator,
             context.runs,
+            context.runs_mutex,
             context.options,
             task.eval_definition,
             task.service,
@@ -177,6 +249,29 @@ fn workerLoop(context: *WorkerContext) !void {
             task.run_index,
         );
     }
+}
+
+fn compareRunResults(_: void, a: RunResult, b: RunResult) bool {
+    var order = std.mem.order(u8, a.group, b.group);
+    if (order != .eq) return order == .lt;
+
+    order = std.mem.order(u8, a.eval_id, b.eval_id);
+    if (order != .eq) return order == .lt;
+
+    order = std.mem.order(u8, a.service_name, b.service_name);
+    if (order != .eq) return order == .lt;
+
+    if (a.run_index != b.run_index) {
+        return a.run_index < b.run_index;
+    }
+
+    order = std.mem.order(u8, a.case_id, b.case_id);
+    if (order != .eq) return order == .lt;
+
+    order = std.mem.order(u8, a.model, b.model);
+    if (order != .eq) return order == .lt;
+
+    return false;
 }
 
 fn collectEvalTasks(
@@ -227,6 +322,7 @@ fn runOneCase(
     temp_allocator: std.mem.Allocator,
     arena_allocator: std.mem.Allocator,
     runs: *std.ArrayList(RunResult),
+    runs_mutex: *Mutex,
     options: RunnerOptions,
     eval_definition: registry.EvalDefinition,
     service: services.ServiceConfig,
@@ -237,6 +333,10 @@ fn runOneCase(
     const started_at = std.time.milliTimestamp();
 
     var output = options.service_caller(temp_allocator, service, input) catch |err| {
+
+        runs_mutex.lock();
+        defer runs_mutex.unlock();
+
         try appendRunResult(temp_allocator, arena_allocator, runs, .{
             .group = eval_definition.group,
             .eval_id = eval_definition.id,
@@ -264,6 +364,9 @@ fn runOneCase(
         .score = 0.0,
         .failure_reason = @errorName(err),
     };
+    
+    runs_mutex.lock();
+    defer runs_mutex.unlock();
 
     try appendRunResult(temp_allocator, arena_allocator, runs, .{
         .group = eval_definition.group,
