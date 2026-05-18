@@ -186,6 +186,13 @@ fn writeRunResultJson(json_writer: *std.json.Stringify, result: runner.RunResult
     } else {
         try json_writer.write(@as(?[]const u8, null));
     }
+
+    try json_writer.objectField("attempt_count");
+    try json_writer.write(result.attempt_count);
+
+    try json_writer.objectField("retried");
+    try json_writer.write(result.retried);
+
     try json_writer.objectField("latency_ms");
     try json_writer.write(result.latency_ms);
     try json_writer.endObject();
@@ -543,6 +550,8 @@ fn sampleRun(
         .passed = passed,
         .score = if (passed) 1.0 else 0.0,
         .failure_reason = if (passed) null else "failed",
+        .attempt_count = if (passed) 1 else 2,
+        .retried = !passed,
         .latency_ms = latency_ms,
     };
 }
@@ -700,6 +709,8 @@ test "formatRunResultsJson writes machine readable run artifacts" {
     try std.testing.expect(runs[0].object.get("passed").?.bool);
     try std.testing.expectEqual(@as(i64, 30), runs[1].object.get("latency_ms").?.integer);
     try std.testing.expectEqualStrings("failed", runs[1].object.get("failure_reason").?.string);
+    try std.testing.expectEqual(@as(i64, 2), runs[1].object.get("attempt_count").?.integer);
+    try std.testing.expect(runs[1].object.get("retried").?.bool);
 }
 
 test "formatEvalReportsJson writes grouped aggregate artifacts" {

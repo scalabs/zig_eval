@@ -2,6 +2,12 @@ const std = @import("std");
 
 const max_file_bytes = 1024 * 1024;
 
+pub const RetryConfig = struct {
+    max_attempts: u32 = 1,
+    backoff_ms: u32 = 0,
+    retry_on_status: []const u16 = &.{ 429, 500, 502, 503, 504 },
+};
+
 pub const ServiceConfig = struct {
     name: []const u8,
     base_url: []const u8,
@@ -10,6 +16,7 @@ pub const ServiceConfig = struct {
     provider: ?[]const u8 = null,
     system_prompt: ?[]const u8 = null,
     timeout_ms: u32,
+    retry: RetryConfig = .{},
 };
 
 pub const LoadedServices = struct {
@@ -34,6 +41,8 @@ pub const ChatCallOutput = struct {
     content: []u8,
     model: []u8,
     status_code: u16,
+    attempt_count: u32 = 1,
+    retried: bool = false,
 
     pub fn deinit(self: *ChatCallOutput, allocator: std.mem.Allocator) void {
         allocator.free(self.content);
@@ -79,6 +88,25 @@ pub fn loadServices(
     };
 }
 
+fn shouldRetryStatus(status: std.http.Status, retry_on_status: []const u16) bool {
+    const code: u16 = @intFromEnum(status);
+
+    for (retry_on_status) |retry_code| {
+        if (code == retry_code) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+fn retryDelay(backoff_ms: u32, attempt: u32) void {
+    if (backoff_ms == 0) return;
+
+    const delay_ms: u64 = @as(u64, backoff_ms) * @as(u64, attempt);
+    std.Thread.sleep(delay_ms * std.time.ns_per_ms);
+}
+
 pub fn callChatCompletion(
     allocator: std.mem.Allocator,
     service: ServiceConfig,
@@ -118,23 +146,47 @@ pub fn callChatCompletion(
     var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();
 
-    var response_writer = std.Io.Writer.Allocating.init(allocator);
-    defer response_writer.deinit();
+    var attempt: u32 = 1;
+    const max_attempts: u32 = if (service.retry.max_attempts == 0) 1 else service.retry.max_attempts;
 
-    const fetch_result = try client.fetch(.{
-        .location = .{ .uri = uri },
-        .method = .POST,
-        .payload = payload,
-        .extra_headers = headers.items,
-        .response_writer = &response_writer.writer,
-    });
+    while (attempt <= max_attempts) : (attempt += 1) {
+        var response_writer = std.Io.Writer.Allocating.init(allocator);
+        defer response_writer.deinit();
 
-    return try parseChatCompletionResponse(
-        allocator,
-        fetch_result.status,
-        response_writer.written(),
-        model_name,
-    );
+        const fetch_result = client.fetch(.{
+            .location = .{ .uri = uri },
+            .method = .POST,
+            .payload = payload,
+            .extra_headers = headers.items,
+            .response_writer = &response_writer.writer,
+        }) catch |err| {
+            if (attempt >= max_attempts) {
+                return err;
+            }
+
+            retryDelay(service.retry.backoff_ms, attempt);
+            continue;
+        };
+
+        if (shouldRetryStatus(fetch_result.status, service.retry.retry_on_status) and attempt < max_attempts) {
+            retryDelay(service.retry.backoff_ms, attempt);
+            continue;
+        }
+
+        var parsed = try parseChatCompletionResponse(
+            allocator,
+            fetch_result.status,
+            response_writer.written(),
+            model_name,
+        );
+
+        parsed.attempt_count = attempt;
+        parsed.retried = attempt > 1;
+
+        return parsed;
+    }
+
+    return error.RetryExhausted;
 }
 
 fn parseServiceConfig(

@@ -3,7 +3,12 @@
     "name": "local-product",
     "base_url": "http://127.0.0.1:9000/v1/chat/completions",
     "default_model": "local-eval-model",
-    "timeout_ms": 15000
+    "timeout_ms": 15000,
+    "retry": {
+    "max_attempts": 3,
+    "backoff_ms": 500,
+    "retry_on_status": [429, 500, 502, 503, 504]
+  }
   },
   {
     "name": "product-staging",
@@ -12,6 +17,11 @@
     "default_model": "product-model",
     "provider": "product",
     "system_prompt": "Follow the eval instructions exactly.",
-    "timeout_ms": 30000
+    "timeout_ms": 30000,
+    "retry": {
+    "max_attempts": 3,
+    "backoff_ms": 500,
+    "retry_on_status": [429, 500, 502, 503, 504]
+  }
   }
 ]

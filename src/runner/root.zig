@@ -14,6 +14,8 @@ pub const RunResult = struct {
     passed: bool,
     score: f64,
     failure_reason: ?[]const u8 = null,
+    attempt_count: u32 = 1,
+    retried: bool = false,
     latency_ms: u64,
 };
 
@@ -162,6 +164,8 @@ fn runOneCase(
         .passed = outcome.passed,
         .score = outcome.score,
         .failure_reason = outcome.failure_reason,
+        .attempt_count = output.attempt_count,
+        .retried = output.retried,
         .latency_ms = elapsedMillis(started_at),
     });
 }
@@ -183,6 +187,8 @@ fn appendRunResult(
         .passed = result.passed,
         .score = result.score,
         .failure_reason = if (result.failure_reason) |reason| try arena_allocator.dupe(u8, reason) else null,
+        .attempt_count = result.attempt_count,
+        .retried = result.retried,
         .latency_ms = result.latency_ms,
     });
 }
@@ -357,6 +363,27 @@ test "runEvaluations returns dataset load failure" {
         .service_caller = fakeServiceCaller,
         .matcher_evaluator = fakeMatcherPass,
     }));
+}
+
+test "RunResult stores retry metadata" {
+    const result = RunResult{
+        .group = "retry_group",
+        .eval_id = "retry.eval",
+        .service_name = "retry-service",
+        .model = "test-model",
+        .run_index = 1,
+        .case_id = "case-1",
+        .output = "hello",
+        .passed = true,
+        .score = 1.0,
+        .failure_reason = null,
+        .attempt_count = 3,
+        .retried = true,
+        .latency_ms = 250,
+    };
+
+    try std.testing.expectEqual(@as(u32, 3), result.attempt_count);
+    try std.testing.expect(result.retried);
 }
 
 fn evalDefinition(

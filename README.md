@@ -135,6 +135,20 @@ It includes:
 - one smoke eval using `exact_match`
 - one structured-output eval using `json_fields`
 
+## Retry policy
+
+Services may define retry behavior:
+
+```json
+{
+  "retry": {
+    "max_attempts": 3,
+    "backoff_ms": 500,
+    "retry_on_status": [429, 500, 502, 503, 504]
+  }
+}
+```
+
 ## Design Direction
 
 The v1 focus is a small, stable core:
