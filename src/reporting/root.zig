@@ -13,10 +13,16 @@ pub const LatencyStats = struct {
     p95_ms: u64,
 };
 
+pub const RetryStats = struct {
+    retried_runs: usize,
+    total_attempts: usize,
+};
+
 pub const AggregateStats = struct {
     counts: AggregateCounts,
     pass_rate: f64,
     latency: LatencyStats,
+    retries: RetryStats,
 };
 
 pub const ModelReport = struct {
@@ -279,6 +285,8 @@ const Accumulator = struct {
         .failed = 0,
     },
     latencies: std.ArrayList(u64) = .{},
+    retried_runs: usize = 0,
+    total_attempts: usize = 0,
 
     fn add(self: *Accumulator, allocator: std.mem.Allocator, result: runner.RunResult) !void {
         self.counts.total_runs += 1;
@@ -288,6 +296,12 @@ const Accumulator = struct {
             self.counts.failed += 1;
         }
         try self.latencies.append(allocator, result.latency_ms);
+
+        self.total_attempts += result.attempt_count;
+
+        if (result.retried) {
+            self.retried_runs += 1;
+        }
     }
 
     fn deinit(self: *Accumulator, allocator: std.mem.Allocator) void {
@@ -299,6 +313,10 @@ const Accumulator = struct {
             .counts = self.counts,
             .pass_rate = passRate(self.counts),
             .latency = try computeLatencyStats(allocator, self.latencies.items),
+            .retries = .{
+                         .retried_runs = self.retried_runs,
+                         .total_attempts = self.total_attempts,
+            },
         };
     }
 };
@@ -571,6 +589,10 @@ test "EvalReport stores grouped report shapes" {
                     .mean_ms = 100.0,
                     .p50_ms = 95,
                     .p95_ms = 140,
+                },
+                .retries = .{
+                            .retried_runs = 1,
+                            .total_attempts = 11,
                 },
             },
         },
