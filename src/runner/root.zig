@@ -50,6 +50,8 @@ pub const RunnerOptions = struct {
     run_count_override: ?u32 = null,
     parallelism: u32 = 1,
     max_inflight_per_service: u32 = 1,
+    show_progress: bool = false,
+    progress_writer: ?*std.Io.Writer = null,
     service_caller: ServiceCaller = defaultServiceCaller,
     matcher_evaluator: MatcherEvaluator,
 };
@@ -82,6 +84,8 @@ pub const WorkerContext = struct {
     next_index: *usize,
     index_mutex: *Mutex,
     service_limiter: *ServiceLimiter,
+    completed_count: *usize,
+    progress_mutex: *Mutex,
     options: RunnerOptions,
 };
 
@@ -167,6 +171,8 @@ pub fn runEvaluations(
     } else {
         var index_mutex = Mutex{};
         var next_index: usize = 0;
+        var completed_count: usize = 0;
+        var progress_mutex = Mutex{};
         var service_names = try allocator.alloc([]const u8, options.services.len);
         defer allocator.free(service_names);
 
@@ -198,6 +204,8 @@ pub fn runEvaluations(
             .next_index = &next_index,
             .index_mutex = &index_mutex,
             .service_limiter = &service_limiter,
+            .completed_count = &completed_count,
+            .progress_mutex = &progress_mutex,
             .options = options,
         };
 
@@ -233,7 +241,7 @@ fn workerLoop(context: *WorkerContext) !void {
         context.index_mutex.unlock();
 
         const task = context.tasks[index];
-        
+
         context.service_limiter.acquire(task.service.name);
         defer context.service_limiter.release(task.service.name);
 
@@ -248,6 +256,21 @@ fn workerLoop(context: *WorkerContext) !void {
             task.case,
             task.run_index,
         );
+
+        context.progress_mutex.lock();
+
+        context.completed_count.* += 1;
+
+        if (context.options.show_progress) {
+            if (context.options.progress_writer) |writer| {
+                try writer.print(
+                    "completed {d}/{d} eval runs\n",
+                    .{ context.completed_count.*, context.tasks.len },
+                );
+            }
+        }
+
+        context.progress_mutex.unlock();
     }
 }
 
@@ -333,7 +356,6 @@ fn runOneCase(
     const started_at = std.time.milliTimestamp();
 
     var output = options.service_caller(temp_allocator, service, input) catch |err| {
-
         runs_mutex.lock();
         defer runs_mutex.unlock();
 
@@ -364,7 +386,7 @@ fn runOneCase(
         .score = 0.0,
         .failure_reason = @errorName(err),
     };
-    
+
     runs_mutex.lock();
     defer runs_mutex.unlock();
 

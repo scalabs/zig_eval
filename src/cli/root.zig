@@ -152,6 +152,8 @@ fn runRegistryEvals(
         .run_count_override = options.run_count_override,
         .parallelism = options.parallelism,
         .max_inflight_per_service = options.max_inflight_per_service,
+        .show_progress = options.format == .text,
+        .progress_writer = writer,
         .service_caller = dependencies.service_caller,
         .matcher_evaluator = evaluateMatcher,
     });
