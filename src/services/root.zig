@@ -206,6 +206,7 @@ fn parseServiceConfig(
         .provider = try dupOptionalString(allocator, object, "provider"),
         .system_prompt = try dupOptionalString(allocator, object, "system_prompt"),
         .timeout_ms = try parseRequiredU32(object, "timeout_ms"),
+        .retry = try parseOptionalRetryConfig(allocator, object),
     };
 }
 
@@ -474,6 +475,66 @@ fn parseRequiredU32(
     return std.math.cast(u32, integer) orelse error.InvalidServiceConfig;
 }
 
+fn parseOptionalRetryConfig(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+) !RetryConfig {
+    const value = object.get("retry") orelse return .{};
+    const retry_object = switch (value) {
+        .object => |retry_object| retry_object,
+        else => return error.InvalidServiceConfig,
+    };
+
+    return .{
+        .max_attempts = try parseOptionalU32(retry_object, "max_attempts", 1, false),
+        .backoff_ms = try parseOptionalU32(retry_object, "backoff_ms", 0, true),
+        .retry_on_status = try parseOptionalStatusList(allocator, retry_object, "retry_on_status"),
+    };
+}
+
+fn parseOptionalU32(
+    object: std.json.ObjectMap,
+    field_name: []const u8,
+    default_value: u32,
+    allow_zero: bool,
+) !u32 {
+    const value = object.get(field_name) orelse return default_value;
+    const integer = switch (value) {
+        .integer => |integer| integer,
+        else => return error.InvalidServiceConfig,
+    };
+    if (integer < 0) return error.InvalidServiceConfig;
+    if (!allow_zero and integer == 0) return error.InvalidServiceConfig;
+    return std.math.cast(u32, integer) orelse error.InvalidServiceConfig;
+}
+
+fn parseOptionalStatusList(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+    field_name: []const u8,
+) ![]const u16 {
+    const default_retry = RetryConfig{};
+    const value = object.get(field_name) orelse return default_retry.retry_on_status;
+    const entries = switch (value) {
+        .array => |array| array.items,
+        else => return error.InvalidServiceConfig,
+    };
+
+    var items = std.ArrayList(u16){};
+    defer items.deinit(allocator);
+
+    for (entries) |entry| {
+        const integer = switch (entry) {
+            .integer => |integer| integer,
+            else => return error.InvalidServiceConfig,
+        };
+        if (integer < 100 or integer > 599) return error.InvalidServiceConfig;
+        try items.append(allocator, std.math.cast(u16, integer) orelse return error.InvalidServiceConfig);
+    }
+
+    return try allocator.dupe(u16, items.items);
+}
+
 test "ServiceConfig stores v1 fields" {
     const service = ServiceConfig{
         .name = "product-api",
@@ -506,7 +567,12 @@ test "loadServices loads valid services.json" {
         \\    "default_model": "gpt-4.1-mini",
         \\    "provider": "openai",
         \\    "system_prompt": "Be precise.",
-        \\    "timeout_ms": 30000
+        \\    "timeout_ms": 30000,
+        \\    "retry": {
+        \\      "max_attempts": 4,
+        \\      "backoff_ms": 250,
+        \\      "retry_on_status": [429, 503]
+        \\    }
         \\  }
         \\]
         ,
@@ -518,6 +584,10 @@ test "loadServices loads valid services.json" {
     try std.testing.expectEqual(@as(usize, 1), loaded.items.len);
     try std.testing.expectEqualStrings("product-api", loaded.items[0].name);
     try std.testing.expectEqualStrings("openai", loaded.items[0].provider.?);
+    try std.testing.expectEqual(@as(u32, 4), loaded.items[0].retry.max_attempts);
+    try std.testing.expectEqual(@as(u32, 250), loaded.items[0].retry.backoff_ms);
+    try std.testing.expectEqual(@as(usize, 2), loaded.items[0].retry.retry_on_status.len);
+    try std.testing.expectEqual(@as(u16, 429), loaded.items[0].retry.retry_on_status[0]);
 }
 
 test "loadServices allows unauthenticated product endpoints" {
@@ -693,6 +763,9 @@ test "example services registry loads" {
     try std.testing.expectEqual(@as(usize, 2), loaded.items.len);
     try std.testing.expectEqualStrings("local-product", loaded.items[0].name);
     try std.testing.expect(loaded.items[0].api_key_env == null);
+    try std.testing.expectEqual(@as(u32, 3), loaded.items[0].retry.max_attempts);
+    try std.testing.expectEqual(@as(u32, 500), loaded.items[0].retry.backoff_ms);
+    try std.testing.expectEqual(@as(usize, 5), loaded.items[0].retry.retry_on_status.len);
     try std.testing.expectEqualStrings("product-staging", loaded.items[1].name);
     try std.testing.expectEqualStrings("PRODUCT_STAGING_API_KEY", loaded.items[1].api_key_env.?);
 }

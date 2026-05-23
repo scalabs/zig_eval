@@ -33,6 +33,9 @@ directory. Each eval definition must point to an existing dataset path.
 | `api_key_env` | no | Environment variable read for Bearer-token auth. |
 | `provider` | no | Provider value included in the OpenAI-style payload. |
 | `system_prompt` | no | Default system prompt added before user prompts. |
+| `retry.max_attempts` | no | Maximum attempts for retryable service calls. Defaults to `1`. |
+| `retry.backoff_ms` | no | Linear backoff delay in milliseconds between retry attempts. |
+| `retry.retry_on_status` | no | HTTP status codes that should retry before failing. |
 
 Example:
 
@@ -44,7 +47,12 @@ Example:
   "default_model": "product-model",
   "provider": "product",
   "system_prompt": "Follow the eval instructions exactly.",
-  "timeout_ms": 30000
+  "timeout_ms": 30000,
+  "retry": {
+    "max_attempts": 3,
+    "backoff_ms": 500,
+    "retry_on_status": [429, 500, 502, 503, 504]
+  }
 }
 ```
 
@@ -99,6 +107,7 @@ Important fields:
 - `run_index`
 - `output`
 - `passed`, `score`, `failure_reason`
+- `attempt_count`, `retried`
 - `latency_ms`
 
 Service call failures are converted into failed run results with
@@ -123,6 +132,8 @@ Service call failures are converted into failed run results with
       "passed": true,
       "score": 1,
       "failure_reason": null,
+      "attempt_count": 1,
+      "retried": false,
       "latency_ms": 42
     }
   ]
@@ -149,6 +160,10 @@ Service call failures are converted into failed run results with
           "mean_ms": 42,
           "p50_ms": 40,
           "p95_ms": 44
+        },
+        "retries": {
+          "retried_runs": 0,
+          "total_attempts": 2
         }
       },
       "services": []

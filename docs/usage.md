@@ -31,6 +31,18 @@ Each service needs:
 `api_key_env` for local or internal endpoints that do not require Bearer-token
 authentication.
 
+Services can also define retry behavior:
+
+```json
+{
+  "retry": {
+    "max_attempts": 3,
+    "backoff_ms": 500,
+    "retry_on_status": [429, 500, 502, 503, 504]
+  }
+}
+```
+
 ## 2. Define Evals
 
 Eval definitions live under `examples/registry/evals`.
@@ -92,6 +104,12 @@ Run one eval and write aggregate JSON to stdout:
 zig build run -- run --registry examples/registry --service local-product --eval smoke.reply_ok --format json
 ```
 
+Run with bounded parallelism while limiting concurrent requests per service:
+
+```sh
+zig build run -- run --registry examples/registry --parallel 4 --max-inflight-per-service 2
+```
+
 Supported flags:
 
 - `--registry PATH`: registry root, default `examples/registry`
@@ -99,10 +117,16 @@ Supported flags:
 - `--group GROUP`: run only one eval group
 - `--eval ID`: run only one eval id
 - `--runs N`: override each eval's `default_run_count`
+- `--parallel N`: number of worker threads, default `1`
+- `--max-inflight-per-service N`: max concurrent requests per service, default
+  `1`
 - `--format text|json`: report format, default `text`
 
 `run` requires the selected service endpoint to be reachable and compatible
 with OpenAI-style chat completions.
+
+Text output prints progress lines during parallel runs. JSON output suppresses
+progress so stdout remains machine-readable.
 
 ## 5. Wire The Library From Zig
 
@@ -168,5 +192,5 @@ pub fn runProductEvals(allocator: std.mem.Allocator) !void {
 
 - Service calls must target an OpenAI-compatible chat-completions endpoint.
 - JSON field matching checks root-level fields only.
-- Streaming, tool-calling, multimodal evals, model-graded evals, retries, and
-  advanced significance testing are out of scope for v1.
+- Streaming, tool-calling, multimodal evals, model-graded evals, and advanced
+  significance testing are out of scope for v1.

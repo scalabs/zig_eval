@@ -20,6 +20,8 @@ models.
 - Aggregate results into plain-text and JSON report artifacts.
 - Run evals from the `zig_eval` CLI with service, group, eval, run-count, and
   output-format filters.
+- Run evals with bounded parallelism, per-service throttling, and retry
+  metadata in reports.
 
 ## How It Works
 
@@ -49,6 +51,12 @@ Use JSON report output:
 
 ```sh
 zig build run -- run --registry examples/registry --service local-product --format json
+```
+
+Run with bounded parallel workers:
+
+```sh
+zig build run -- run --registry examples/registry --parallel 4 --max-inflight-per-service 2
 ```
 
 `run` requires the selected service endpoint to be reachable.

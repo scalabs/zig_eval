@@ -253,6 +253,8 @@ fn writeAggregateStatsJson(json_writer: *std.json.Stringify, stats: AggregateSta
     try json_writer.write(stats.pass_rate);
     try json_writer.objectField("latency");
     try writeLatencyStatsJson(json_writer, stats.latency);
+    try json_writer.objectField("retries");
+    try writeRetryStatsJson(json_writer, stats.retries);
     try json_writer.endObject();
 }
 
@@ -275,6 +277,15 @@ fn writeLatencyStatsJson(json_writer: *std.json.Stringify, stats: LatencyStats) 
     try json_writer.write(stats.p50_ms);
     try json_writer.objectField("p95_ms");
     try json_writer.write(stats.p95_ms);
+    try json_writer.endObject();
+}
+
+fn writeRetryStatsJson(json_writer: *std.json.Stringify, stats: RetryStats) !void {
+    try json_writer.beginObject();
+    try json_writer.objectField("retried_runs");
+    try json_writer.write(stats.retried_runs);
+    try json_writer.objectField("total_attempts");
+    try json_writer.write(stats.total_attempts);
     try json_writer.endObject();
 }
 
@@ -761,7 +772,10 @@ test "formatEvalReportsJson writes grouped aggregate artifacts" {
     const eval_report = evals[0].object;
     try std.testing.expectEqualStrings("smoke", eval_report.get("group").?.string);
     try std.testing.expectEqualStrings("reply_ok", eval_report.get("eval_id").?.string);
-    try std.testing.expectEqual(@as(i64, 2), eval_report.get("stats").?.object.get("counts").?.object.get("total_runs").?.integer);
+    const eval_stats = eval_report.get("stats").?.object;
+    try std.testing.expectEqual(@as(i64, 2), eval_stats.get("counts").?.object.get("total_runs").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), eval_stats.get("retries").?.object.get("retried_runs").?.integer);
+    try std.testing.expectEqual(@as(i64, 3), eval_stats.get("retries").?.object.get("total_attempts").?.integer);
 
     const service_reports = eval_report.get("services").?.array.items;
     try std.testing.expectEqualStrings("product-api", service_reports[0].object.get("service_name").?.string);
