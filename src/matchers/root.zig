@@ -23,6 +23,12 @@ pub const ModelGradeMatcherConfig = struct {
     pass_score: f64 = 1.0,
 };
 
+pub const ModelGradePromptInput = struct {
+    input: []const u8,
+    output: []const u8,
+    ideal: ?[]const u8 = null,
+};
+
 pub const MatcherConfig = union(MatcherKind) {
     exact_match: TextMatchOptions,
     includes: TextMatchOptions,
@@ -35,6 +41,38 @@ pub const MatchOutcome = struct {
     score: f64,
     failure_reason: ?[]const u8 = null,
 };
+
+pub fn renderModelGradePrompt(
+    allocator: std.mem.Allocator,
+    config: ModelGradeMatcherConfig,
+    input: ModelGradePromptInput,
+) ![]u8 {
+    const ideal = input.ideal orelse "No ideal answer was provided.";
+    return std.fmt.allocPrint(allocator,
+        \\You are grading an LLM or product response for an eval.
+        \\
+        \\Rubric:
+        \\{s}
+        \\
+        \\Passing score:
+        \\{d:.3}
+        \\
+        \\Eval input:
+        \\{s}
+        \\
+        \\Candidate output:
+        \\{s}
+        \\
+        \\Ideal answer:
+        \\{s}
+        \\
+        \\Return JSON only with this exact shape:
+        \\{{"score":0.0,"passed":false,"reason":"short explanation"}}
+        \\
+        \\Score must be between 0 and 1. Set passed to true only when score is greater than or equal to the passing score.
+        \\
+    , .{ config.rubric, config.pass_score, input.input, input.output, ideal });
+}
 
 pub fn parseMatcherConfig(
     allocator: std.mem.Allocator,
@@ -393,6 +431,50 @@ test "parseMatcherConfig rejects invalid model_grade pass_score" {
     );
 }
 
+test "renderModelGradePrompt includes grading context and json contract" {
+    const prompt = try renderModelGradePrompt(
+        std.testing.allocator,
+        .{
+            .judge_service = "judge",
+            .judge_model = "judge-model",
+            .rubric = "Check factual correctness and completeness.",
+            .pass_score = 0.8,
+        },
+        .{
+            .input = "What is the capital of France?",
+            .output = "Paris.",
+            .ideal = "Paris",
+        },
+    );
+    defer std.testing.allocator.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Check factual correctness and completeness.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "0.800") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "What is the capital of France?") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Paris.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Ideal answer:\nParis") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "\"score\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "\"passed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "\"reason\"") != null);
+}
+
+test "renderModelGradePrompt handles missing ideal" {
+    const prompt = try renderModelGradePrompt(
+        std.testing.allocator,
+        .{
+            .judge_service = "judge",
+            .rubric = "Score usefulness.",
+        },
+        .{
+            .input = "Explain retry backoff.",
+            .output = "Retry after a delay.",
+        },
+    );
+    defer std.testing.allocator.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "No ideal answer was provided.") != null);
+}
+
 test "parseMatcherConfig rejects empty required_fields" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -518,4 +600,21 @@ test "evaluate json_fields fails when required field is missing" {
 
     try std.testing.expect(!outcome.passed);
     try std.testing.expectEqualStrings("missing required json field", outcome.failure_reason.?);
+}
+
+test "evaluate model_grade requires judge execution" {
+    try std.testing.expectError(
+        error.ModelGradeRequiresJudge,
+        evaluate(
+            std.testing.allocator,
+            .{
+                .model_grade = .{
+                    .judge_service = "judge",
+                    .rubric = "Score correctness.",
+                },
+            },
+            "candidate",
+            null,
+        ),
+    );
 }

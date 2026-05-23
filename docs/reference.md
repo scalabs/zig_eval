@@ -80,8 +80,9 @@ Supported matcher config kinds:
 - `json_fields`: checks that the output is a JSON object containing configured
   root-level fields.
 - `model_grade`: configures an LLM judge with `judge_service`, optional
-  `judge_model`, `rubric`, and `pass_score`. This is V2 configuration groundwork;
-  judge execution is added separately.
+  `judge_model`, `rubric`, and `pass_score`. The judge prompt includes eval
+  input, candidate output, optional `ideal`, and the rubric. Judge execution is
+  added separately.
 
 Example model-graded matcher:
 
@@ -93,6 +94,12 @@ Example model-graded matcher:
   "rubric": "Score whether the answer is correct, complete, and concise.",
   "pass_score": 0.8
 }
+```
+
+The judge is instructed to return JSON only:
+
+```json
+{"score":0.0,"passed":false,"reason":"short explanation"}
 ```
 
 ## Dataset Case
