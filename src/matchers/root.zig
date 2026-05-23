@@ -4,6 +4,7 @@ pub const MatcherKind = enum {
     exact_match,
     includes,
     json_fields,
+    model_grade,
 };
 
 pub const TextMatchOptions = struct {
@@ -15,10 +16,18 @@ pub const JsonFieldsMatcherConfig = struct {
     required_fields: []const []const u8,
 };
 
+pub const ModelGradeMatcherConfig = struct {
+    judge_service: []const u8,
+    judge_model: ?[]const u8 = null,
+    rubric: []const u8,
+    pass_score: f64 = 1.0,
+};
+
 pub const MatcherConfig = union(MatcherKind) {
     exact_match: TextMatchOptions,
     includes: TextMatchOptions,
     json_fields: JsonFieldsMatcherConfig,
+    model_grade: ModelGradeMatcherConfig,
 };
 
 pub const MatchOutcome = struct {
@@ -70,6 +79,18 @@ pub fn parseMatcherConfig(
         };
     }
 
+    if (std.mem.eql(u8, kind_text, "model_grade")) {
+        try validateFields(object, &.{ "kind", "judge_service", "judge_model", "rubric", "pass_score" });
+        return .{
+            .model_grade = .{
+                .judge_service = try parseRequiredString(allocator, object, "judge_service"),
+                .judge_model = try parseOptionalString(allocator, object, "judge_model"),
+                .rubric = try parseRequiredString(allocator, object, "rubric"),
+                .pass_score = try parseOptionalF64(object, "pass_score", 1.0),
+            },
+        };
+    }
+
     return error.InvalidMatcherConfig;
 }
 
@@ -83,6 +104,7 @@ pub fn evaluate(
         .exact_match => |options| evaluateExactMatch(options, output, ideal),
         .includes => |options| evaluateIncludes(options, output, ideal),
         .json_fields => |config| evaluateJsonFields(allocator, config, output),
+        .model_grade => error.ModelGradeRequiresJudge,
     };
 }
 
@@ -229,7 +251,52 @@ fn parseRequiredFields(
     return allocator.dupe([]const u8, items.items);
 }
 
-test "MatcherConfig supports all v1 matcher kinds" {
+fn parseRequiredString(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+    field_name: []const u8,
+) ![]const u8 {
+    const value = object.get(field_name) orelse return error.InvalidMatcherConfig;
+    const text = switch (value) {
+        .string => |text| text,
+        else => return error.InvalidMatcherConfig,
+    };
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len == 0) return error.InvalidMatcherConfig;
+    return allocator.dupe(u8, trimmed);
+}
+
+fn parseOptionalString(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+    field_name: []const u8,
+) !?[]const u8 {
+    const value = object.get(field_name) orelse return null;
+    const text = switch (value) {
+        .string => |text| text,
+        else => return error.InvalidMatcherConfig,
+    };
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len == 0) return error.InvalidMatcherConfig;
+    return try allocator.dupe(u8, trimmed);
+}
+
+fn parseOptionalF64(
+    object: std.json.ObjectMap,
+    field_name: []const u8,
+    default_value: f64,
+) !f64 {
+    const value = object.get(field_name) orelse return default_value;
+    const parsed = switch (value) {
+        .float => |number| number,
+        .integer => |number| @as(f64, @floatFromInt(number)),
+        else => return error.InvalidMatcherConfig,
+    };
+    if (parsed < 0.0 or parsed > 1.0) return error.InvalidMatcherConfig;
+    return parsed;
+}
+
+test "MatcherConfig supports all matcher kinds" {
     const exact = MatcherConfig{
         .exact_match = .{
             .case_sensitive = true,
@@ -248,11 +315,21 @@ test "MatcherConfig supports all v1 matcher kinds" {
             .required_fields = fields[0..],
         },
     };
+    const model_grade = MatcherConfig{
+        .model_grade = .{
+            .judge_service = "judge",
+            .judge_model = "judge-model",
+            .rubric = "Score correctness from 0 to 1.",
+            .pass_score = 0.8,
+        },
+    };
 
     try std.testing.expect(exact == .exact_match);
     try std.testing.expect(includes == .includes);
     try std.testing.expect(json == .json_fields);
+    try std.testing.expect(model_grade == .model_grade);
     try std.testing.expectEqual(@as(usize, 2), json.json_fields.required_fields.len);
+    try std.testing.expectEqual(@as(f64, 0.8), model_grade.model_grade.pass_score);
 }
 
 test "parseMatcherConfig parses all matcher kinds" {
@@ -260,6 +337,7 @@ test "parseMatcherConfig parses all matcher kinds" {
         "{\"kind\":\"exact_match\",\"case_sensitive\":false}",
         "{\"kind\":\"includes\",\"trim_whitespace\":false}",
         "{\"kind\":\"json_fields\",\"required_fields\":[\"answer\",\"score\"]}",
+        "{\"kind\":\"model_grade\",\"judge_service\":\"judge\",\"judge_model\":\"gpt-judge\",\"rubric\":\"Score correctness.\",\"pass_score\":0.75}",
     };
 
     for (samples) |sample| {
@@ -271,9 +349,48 @@ test "parseMatcherConfig parses all matcher kinds" {
 
         const config = try parseMatcherConfig(arena.allocator(), parsed.value);
         switch (config) {
-            .exact_match, .includes, .json_fields => {},
+            .exact_match, .includes, .json_fields, .model_grade => {},
         }
     }
+}
+
+test "parseMatcherConfig parses model_grade defaults" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        arena.allocator(),
+        "{\"kind\":\"model_grade\",\"judge_service\":\"judge\",\"rubric\":\"Score factual correctness.\"}",
+        .{},
+    );
+    defer parsed.deinit();
+
+    const config = try parseMatcherConfig(arena.allocator(), parsed.value);
+
+    try std.testing.expect(config == .model_grade);
+    try std.testing.expectEqualStrings("judge", config.model_grade.judge_service);
+    try std.testing.expect(config.model_grade.judge_model == null);
+    try std.testing.expectEqualStrings("Score factual correctness.", config.model_grade.rubric);
+    try std.testing.expectEqual(@as(f64, 1.0), config.model_grade.pass_score);
+}
+
+test "parseMatcherConfig rejects invalid model_grade pass_score" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        arena.allocator(),
+        "{\"kind\":\"model_grade\",\"judge_service\":\"judge\",\"rubric\":\"Score correctness.\",\"pass_score\":1.5}",
+        .{},
+    );
+    defer parsed.deinit();
+
+    try std.testing.expectError(
+        error.InvalidMatcherConfig,
+        parseMatcherConfig(arena.allocator(), parsed.value),
+    );
 }
 
 test "parseMatcherConfig rejects empty required_fields" {

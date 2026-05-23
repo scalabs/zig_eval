@@ -79,6 +79,21 @@ Supported matcher config kinds:
   sensitivity and whitespace trimming.
 - `json_fields`: checks that the output is a JSON object containing configured
   root-level fields.
+- `model_grade`: configures an LLM judge with `judge_service`, optional
+  `judge_model`, `rubric`, and `pass_score`. This is V2 configuration groundwork;
+  judge execution is added separately.
+
+Example model-graded matcher:
+
+```json
+{
+  "kind": "model_grade",
+  "judge_service": "judge",
+  "judge_model": "gpt-4.1-mini",
+  "rubric": "Score whether the answer is correct, complete, and concise.",
+  "pass_score": 0.8
+}
+```
 
 ## Dataset Case
 
