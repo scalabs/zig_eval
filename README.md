@@ -164,7 +164,7 @@ The v1 focus is a small, stable core:
 - OpenAI-compatible chat execution.
 - Product-neutral service configuration.
 - Capability-based eval grouping.
-- Deterministic matchers before model-graded judging.
+- Deterministic matchers plus V2 model-graded judging.
 - Clear ownership of allocated data in public APIs.
 
 ## Resources

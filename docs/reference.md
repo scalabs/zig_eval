@@ -81,8 +81,9 @@ Supported matcher config kinds:
   root-level fields.
 - `model_grade`: configures an LLM judge with `judge_service`, optional
   `judge_model`, `rubric`, and `pass_score`. The judge prompt includes eval
-  input, candidate output, optional `ideal`, and the rubric. Judge execution is
-  added separately.
+  input, candidate output, optional `ideal`, and the rubric. The runner calls
+  the judge service and converts the judge JSON into a score and pass/fail
+  result.
 
 Example model-graded matcher:
 

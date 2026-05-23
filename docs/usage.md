@@ -192,5 +192,5 @@ pub fn runProductEvals(allocator: std.mem.Allocator) !void {
 
 - Service calls must target an OpenAI-compatible chat-completions endpoint.
 - JSON field matching checks root-level fields only.
-- Streaming, tool-calling, multimodal evals, model-graded evals, and advanced
-  significance testing are out of scope for v1.
+- Streaming, tool-calling, multimodal evals, and advanced significance testing
+  are out of scope for v1.

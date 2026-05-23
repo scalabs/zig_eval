@@ -25,6 +25,7 @@ pub const MatcherOutcome = struct {
     passed: bool,
     score: f64,
     failure_reason: ?[]const u8 = null,
+    owned_failure_reason: ?[]u8 = null,
 };
 
 pub const ServiceCaller = *const fn (
@@ -376,9 +377,11 @@ fn runOneCase(
     };
     defer output.deinit(temp_allocator);
 
-    const outcome = options.matcher_evaluator(
+    const outcome = evaluateRunMatcher(
         temp_allocator,
+        options,
         eval_definition.matcher,
+        case.input,
         output.content,
         case.ideal,
     ) catch |err| MatcherOutcome{
@@ -386,6 +389,7 @@ fn runOneCase(
         .score = 0.0,
         .failure_reason = @errorName(err),
     };
+    defer if (outcome.owned_failure_reason) |reason| temp_allocator.free(reason);
 
     runs_mutex.lock();
     defer runs_mutex.unlock();
@@ -405,6 +409,95 @@ fn runOneCase(
         .retried = output.retried,
         .latency_ms = elapsedMillis(started_at),
     });
+}
+
+fn evaluateRunMatcher(
+    allocator: std.mem.Allocator,
+    options: RunnerOptions,
+    matcher: matchers.MatcherConfig,
+    input: []const u8,
+    output: []const u8,
+    ideal: ?[]const u8,
+) !MatcherOutcome {
+    return switch (matcher) {
+        .model_grade => |config| evaluateModelGradeMatcher(allocator, options, config, input, output, ideal),
+        else => options.matcher_evaluator(allocator, matcher, output, ideal),
+    };
+}
+
+fn evaluateModelGradeMatcher(
+    allocator: std.mem.Allocator,
+    options: RunnerOptions,
+    config: matchers.ModelGradeMatcherConfig,
+    input: []const u8,
+    output: []const u8,
+    ideal: ?[]const u8,
+) !MatcherOutcome {
+    const judge_service = findServiceByName(options.services, config.judge_service) orelse {
+        return error.JudgeServiceNotFound;
+    };
+
+    const prompt = try matchers.renderModelGradePrompt(allocator, config, .{
+        .input = input,
+        .output = output,
+        .ideal = ideal,
+    });
+    defer allocator.free(prompt);
+
+    var judge_output = try options.service_caller(allocator, judge_service, .{
+        .prompt = prompt,
+        .model_override = config.judge_model,
+    });
+    defer judge_output.deinit(allocator);
+
+    return parseJudgeOutcome(allocator, judge_output.content, config.pass_score);
+}
+
+fn parseJudgeOutcome(
+    allocator: std.mem.Allocator,
+    raw: []const u8,
+    pass_score: f64,
+) !MatcherOutcome {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch {
+        return error.InvalidModelGradeJudgeOutput;
+    };
+    defer parsed.deinit();
+
+    const object = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidModelGradeJudgeOutput,
+    };
+
+    const score = try parseJudgeScore(object.get("score") orelse return error.InvalidModelGradeJudgeOutput);
+    const judge_passed = switch (object.get("passed") orelse return error.InvalidModelGradeJudgeOutput) {
+        .bool => |value| value,
+        else => return error.InvalidModelGradeJudgeOutput,
+    };
+    const reason = switch (object.get("reason") orelse return error.InvalidModelGradeJudgeOutput) {
+        .string => |value| std.mem.trim(u8, value, " \t\r\n"),
+        else => return error.InvalidModelGradeJudgeOutput,
+    };
+    if (reason.len == 0) return error.InvalidModelGradeJudgeOutput;
+
+    const passed = judge_passed and score >= pass_score;
+    const owned_reason = if (passed) null else try allocator.dupe(u8, reason);
+
+    return .{
+        .passed = passed,
+        .score = score,
+        .failure_reason = owned_reason,
+        .owned_failure_reason = owned_reason,
+    };
+}
+
+fn parseJudgeScore(value: std.json.Value) !f64 {
+    const score = switch (value) {
+        .float => |number| number,
+        .integer => |number| @as(f64, @floatFromInt(number)),
+        else => return error.InvalidModelGradeJudgeOutput,
+    };
+    if (score < 0.0 or score > 1.0) return error.InvalidModelGradeJudgeOutput;
+    return score;
 }
 
 fn appendRunResult(
@@ -455,6 +548,13 @@ fn serviceMatchesFilters(
         return false;
     }
     return true;
+}
+
+fn findServiceByName(configured_services: []const services.ServiceConfig, name: []const u8) ?services.ServiceConfig {
+    for (configured_services) |service| {
+        if (std.mem.eql(u8, service.name, name)) return service;
+    }
+    return null;
 }
 
 fn elapsedMillis(started_at: i64) u64 {
@@ -586,6 +686,153 @@ test "runEvaluations records successful service output" {
     try std.testing.expectEqualStrings("test-model", result.runs[0].model);
 }
 
+test "runEvaluations executes model_grade through judge service" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeDataset(tmp.dir, "cases.jsonl", "case-1", "prompt");
+
+    const allowlist = [_][]const u8{"product"};
+    const evals = [_]registry.EvalDefinition{evalDefinitionWithMatcher(
+        "eval.model_grade",
+        "cases.jsonl",
+        allowlist[0..],
+        .{
+            .model_grade = .{
+                .judge_service = "judge",
+                .judge_model = "judge-model",
+                .rubric = "Score correctness.",
+                .pass_score = 0.8,
+            },
+        },
+    )};
+    const configured_services = [_]services.ServiceConfig{
+        serviceConfig("product"),
+        serviceConfig("judge"),
+    };
+
+    var result = try runEvaluations(std.testing.allocator, .{
+        .root_dir = tmp.dir,
+        .services = configured_services[0..],
+        .evals = evals[0..],
+        .service_caller = fakeModelGradeServiceCaller,
+        .matcher_evaluator = fakeMatcherPass,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.runs.len);
+    try std.testing.expect(result.runs[0].passed);
+    try std.testing.expectEqual(@as(f64, 0.9), result.runs[0].score);
+    try std.testing.expectEqualStrings("product", result.runs[0].service_name);
+    try std.testing.expectEqualStrings("candidate answer", result.runs[0].output);
+}
+
+test "runEvaluations fails model_grade when judge service is missing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeDataset(tmp.dir, "cases.jsonl", "case-1", "prompt");
+
+    const allowlist = [_][]const u8{"product"};
+    const evals = [_]registry.EvalDefinition{evalDefinitionWithMatcher(
+        "eval.model_grade",
+        "cases.jsonl",
+        allowlist[0..],
+        .{
+            .model_grade = .{
+                .judge_service = "missing-judge",
+                .rubric = "Score correctness.",
+            },
+        },
+    )};
+    const configured_services = [_]services.ServiceConfig{serviceConfig("product")};
+
+    var result = try runEvaluations(std.testing.allocator, .{
+        .root_dir = tmp.dir,
+        .services = configured_services[0..],
+        .evals = evals[0..],
+        .service_caller = fakeModelGradeServiceCaller,
+        .matcher_evaluator = fakeMatcherPass,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.runs.len);
+    try std.testing.expect(!result.runs[0].passed);
+    try std.testing.expectEqualStrings("JudgeServiceNotFound", result.runs[0].failure_reason.?);
+}
+
+test "runEvaluations fails model_grade for invalid judge json" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeDataset(tmp.dir, "cases.jsonl", "case-1", "prompt");
+
+    const allowlist = [_][]const u8{"product"};
+    const evals = [_]registry.EvalDefinition{evalDefinitionWithMatcher(
+        "eval.model_grade",
+        "cases.jsonl",
+        allowlist[0..],
+        .{
+            .model_grade = .{
+                .judge_service = "judge",
+                .rubric = "Score correctness.",
+            },
+        },
+    )};
+    const configured_services = [_]services.ServiceConfig{
+        serviceConfig("product"),
+        serviceConfig("judge"),
+    };
+
+    var result = try runEvaluations(std.testing.allocator, .{
+        .root_dir = tmp.dir,
+        .services = configured_services[0..],
+        .evals = evals[0..],
+        .service_caller = fakeInvalidJudgeServiceCaller,
+        .matcher_evaluator = fakeMatcherPass,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.runs.len);
+    try std.testing.expect(!result.runs[0].passed);
+    try std.testing.expectEqualStrings("InvalidModelGradeJudgeOutput", result.runs[0].failure_reason.?);
+}
+
+test "runEvaluations records model_grade failure reason from judge" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeDataset(tmp.dir, "cases.jsonl", "case-1", "prompt");
+
+    const allowlist = [_][]const u8{"product"};
+    const evals = [_]registry.EvalDefinition{evalDefinitionWithMatcher(
+        "eval.model_grade",
+        "cases.jsonl",
+        allowlist[0..],
+        .{
+            .model_grade = .{
+                .judge_service = "judge",
+                .rubric = "Score correctness.",
+                .pass_score = 0.8,
+            },
+        },
+    )};
+    const configured_services = [_]services.ServiceConfig{
+        serviceConfig("product"),
+        serviceConfig("judge"),
+    };
+
+    var result = try runEvaluations(std.testing.allocator, .{
+        .root_dir = tmp.dir,
+        .services = configured_services[0..],
+        .evals = evals[0..],
+        .service_caller = fakeFailingJudgeServiceCaller,
+        .matcher_evaluator = fakeMatcherPass,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.runs.len);
+    try std.testing.expect(!result.runs[0].passed);
+    try std.testing.expectEqual(@as(f64, 0.4), result.runs[0].score);
+    try std.testing.expectEqualStrings("Missing key facts.", result.runs[0].failure_reason.?);
+}
+
 test "runEvaluations returns dataset load failure" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -628,13 +875,22 @@ fn evalDefinition(
     dataset_path: []const u8,
     service_allowlist: ?[]const []const u8,
 ) registry.EvalDefinition {
+    return evalDefinitionWithMatcher(id, dataset_path, service_allowlist, .{ .exact_match = .{} });
+}
+
+fn evalDefinitionWithMatcher(
+    id: []const u8,
+    dataset_path: []const u8,
+    service_allowlist: ?[]const []const u8,
+    matcher: matchers.MatcherConfig,
+) registry.EvalDefinition {
     return .{
         .id = id,
         .group = "quality",
         .description = "test eval",
         .dataset_path = dataset_path,
         .split = "test",
-        .matcher = .{ .exact_match = .{} },
+        .matcher = matcher,
         .default_run_count = 1,
         .service_allowlist = service_allowlist,
     };
@@ -686,6 +942,74 @@ fn fakeServiceFailure(
     _ = service;
     _ = input;
     return error.FakeServiceFailure;
+}
+
+fn fakeModelGradeServiceCaller(
+    allocator: std.mem.Allocator,
+    service: services.ServiceConfig,
+    input: services.ChatCallInput,
+) anyerror!services.ChatCallOutput {
+    if (std.mem.eql(u8, service.name, "judge")) {
+        if (input.model_override == null or !std.mem.eql(u8, input.model_override.?, "judge-model")) {
+            return error.ExpectedJudgeModelOverride;
+        }
+        if (std.mem.indexOf(u8, input.prompt, "candidate answer") == null) {
+            return error.ExpectedCandidateOutputInJudgePrompt;
+        }
+        return .{
+            .content = try allocator.dupe(u8, "{\"score\":0.9,\"passed\":true,\"reason\":\"Correct.\"}"),
+            .model = try allocator.dupe(u8, "judge-model"),
+            .status_code = 200,
+        };
+    }
+
+    return .{
+        .content = try allocator.dupe(u8, "candidate answer"),
+        .model = try allocator.dupe(u8, service.default_model),
+        .status_code = 200,
+    };
+}
+
+fn fakeInvalidJudgeServiceCaller(
+    allocator: std.mem.Allocator,
+    service: services.ServiceConfig,
+    input: services.ChatCallInput,
+) anyerror!services.ChatCallOutput {
+    _ = input;
+    if (std.mem.eql(u8, service.name, "judge")) {
+        return .{
+            .content = try allocator.dupe(u8, "not json"),
+            .model = try allocator.dupe(u8, service.default_model),
+            .status_code = 200,
+        };
+    }
+
+    return .{
+        .content = try allocator.dupe(u8, "candidate answer"),
+        .model = try allocator.dupe(u8, service.default_model),
+        .status_code = 200,
+    };
+}
+
+fn fakeFailingJudgeServiceCaller(
+    allocator: std.mem.Allocator,
+    service: services.ServiceConfig,
+    input: services.ChatCallInput,
+) anyerror!services.ChatCallOutput {
+    _ = input;
+    if (std.mem.eql(u8, service.name, "judge")) {
+        return .{
+            .content = try allocator.dupe(u8, "{\"score\":0.4,\"passed\":false,\"reason\":\"Missing key facts.\"}"),
+            .model = try allocator.dupe(u8, service.default_model),
+            .status_code = 200,
+        };
+    }
+
+    return .{
+        .content = try allocator.dupe(u8, "candidate answer"),
+        .model = try allocator.dupe(u8, service.default_model),
+        .status_code = 200,
+    };
 }
 
 fn fakeMatcherPass(
