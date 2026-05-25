@@ -48,6 +48,7 @@ pub const RunnerOptions = struct {
     service_filter: ?[]const u8 = null,
     group_filter: ?[]const u8 = null,
     eval_filter: ?[]const u8 = null,
+    judge_service_override: ?[]const u8 = null,
     run_count_override: ?u32 = null,
     parallelism: u32 = 1,
     max_inflight_per_service: u32 = 1,
@@ -433,7 +434,8 @@ fn evaluateModelGradeMatcher(
     output: []const u8,
     ideal: ?[]const u8,
 ) !MatcherOutcome {
-    const judge_service = findServiceByName(options.services, config.judge_service) orelse {
+    const judge_service_name = options.judge_service_override orelse config.judge_service;
+    const judge_service = findServiceByName(options.services, judge_service_name) orelse {
         return error.JudgeServiceNotFound;
     };
 
@@ -726,6 +728,44 @@ test "runEvaluations executes model_grade through judge service" {
     try std.testing.expectEqualStrings("candidate answer", result.runs[0].output);
 }
 
+test "runEvaluations can override model_grade judge service" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeDataset(tmp.dir, "cases.jsonl", "case-1", "prompt");
+
+    const allowlist = [_][]const u8{"product"};
+    const evals = [_]registry.EvalDefinition{evalDefinitionWithMatcher(
+        "eval.model_grade",
+        "cases.jsonl",
+        allowlist[0..],
+        .{
+            .model_grade = .{
+                .judge_service = "default-judge",
+                .rubric = "Score correctness.",
+                .pass_score = 0.8,
+            },
+        },
+    )};
+    const configured_services = [_]services.ServiceConfig{
+        serviceConfig("product"),
+        serviceConfig("override-judge"),
+    };
+
+    var result = try runEvaluations(std.testing.allocator, .{
+        .root_dir = tmp.dir,
+        .services = configured_services[0..],
+        .evals = evals[0..],
+        .judge_service_override = "override-judge",
+        .service_caller = fakeOverrideJudgeServiceCaller,
+        .matcher_evaluator = fakeMatcherPass,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.runs.len);
+    try std.testing.expect(result.runs[0].passed);
+    try std.testing.expectEqual(@as(f64, 0.95), result.runs[0].score);
+}
+
 test "runEvaluations fails model_grade when judge service is missing" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -982,6 +1022,33 @@ fn fakeInvalidJudgeServiceCaller(
             .model = try allocator.dupe(u8, service.default_model),
             .status_code = 200,
         };
+    }
+
+    return .{
+        .content = try allocator.dupe(u8, "candidate answer"),
+        .model = try allocator.dupe(u8, service.default_model),
+        .status_code = 200,
+    };
+}
+
+fn fakeOverrideJudgeServiceCaller(
+    allocator: std.mem.Allocator,
+    service: services.ServiceConfig,
+    input: services.ChatCallInput,
+) anyerror!services.ChatCallOutput {
+    if (std.mem.eql(u8, service.name, "override-judge")) {
+        if (std.mem.indexOf(u8, input.prompt, "candidate answer") == null) {
+            return error.ExpectedCandidateOutputInJudgePrompt;
+        }
+        return .{
+            .content = try allocator.dupe(u8, "{\"score\":0.95,\"passed\":true,\"reason\":\"Strong answer.\"}"),
+            .model = try allocator.dupe(u8, service.default_model),
+            .status_code = 200,
+        };
+    }
+
+    if (std.mem.eql(u8, service.name, "default-judge")) {
+        return error.DefaultJudgeShouldNotBeCalled;
     }
 
     return .{

@@ -104,6 +104,12 @@ Run one eval and write aggregate JSON to stdout:
 zig build run -- run --registry examples/registry --service local-product --eval smoke.reply_ok --format json
 ```
 
+Run a model-graded eval with a specific judge service:
+
+```sh
+zig build run -- run --registry examples/registry --service local-product --eval quality.helpful_summary --judge-service judge
+```
+
 Run with bounded parallelism while limiting concurrent requests per service:
 
 ```sh
@@ -116,6 +122,7 @@ Supported flags:
 - `--service NAME`: run only one service
 - `--group GROUP`: run only one eval group
 - `--eval ID`: run only one eval id
+- `--judge-service NAME`: override the judge service for `model_grade` evals
 - `--runs N`: override each eval's `default_run_count`
 - `--parallel N`: number of worker threads, default `1`
 - `--max-inflight-per-service N`: max concurrent requests per service, default

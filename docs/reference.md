@@ -83,7 +83,7 @@ Supported matcher config kinds:
   `judge_model`, `rubric`, and `pass_score`. The judge prompt includes eval
   input, candidate output, optional `ideal`, and the rubric. The runner calls
   the judge service and converts the judge JSON into a score and pass/fail
-  result.
+  result. CLI users can override `judge_service` with `--judge-service`.
 
 Example model-graded matcher:
 
