@@ -14,6 +14,7 @@ models.
 - Load grouped eval definitions from a registry directory.
 - Load eval cases from JSONL datasets.
 - Evaluate exact-match, includes, and required JSON field checks.
+- Evaluate model-graded checks through a configured LLM judge service.
 - Call an OpenAI-compatible `POST /v1/chat/completions` endpoint.
 - Support authenticated and unauthenticated product endpoints.
 - Run grouped eval definitions across configured services and datasets.
@@ -57,6 +58,12 @@ Run with bounded parallel workers:
 
 ```sh
 zig build run -- run --registry examples/registry --parallel 4 --max-inflight-per-service 2
+```
+
+Run a model-graded eval with the configured judge service:
+
+```sh
+zig build run -- run --registry examples/registry --service local-product --eval quality.helpful_summary --judge-service judge
 ```
 
 `run` requires the selected service endpoint to be reachable.
@@ -140,8 +147,22 @@ It includes:
 
 - one unauthenticated local product service
 - one authenticated staging product service
+- one judge service for model-graded evals
 - one smoke eval using `exact_match`
 - one structured-output eval using `json_fields`
+- one quality eval using `model_grade`
+
+## Model-Graded Evals
+
+Use `model_grade` when an answer cannot be checked with a simple exact,
+contains, or JSON-field rule. The product service generates the candidate
+answer, then a separate judge service scores it against a rubric and returns
+JSON with `score`, `passed`, and `reason`.
+
+Model-graded evals are useful for quality checks such as helpfulness,
+correctness, completeness, summarization quality, or instruction following.
+They are more flexible than deterministic matchers, but they cost an extra
+model call and depend on the quality of the judge rubric.
 
 ## Retry policy
 

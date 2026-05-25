@@ -84,7 +84,58 @@ case with an input prompt and optional expected value.
 `exact_match` and `includes` use `ideal`. `json_fields` checks the service
 output for configured root-level JSON fields.
 
-## 4. Run From The CLI
+## 4. Configure Model-Graded Evals
+
+Use `model_grade` for quality checks where there is no single exact expected
+answer. The runner first calls the selected product service, then sends the
+original input, candidate output, optional `ideal`, and rubric to the judge
+service.
+
+The judge service is just another OpenAI-compatible service in `services.json`:
+
+```json
+{
+  "name": "judge",
+  "base_url": "https://api.openai.com/v1/chat/completions",
+  "api_key_env": "OPENAI_API_KEY",
+  "default_model": "gpt-4.1-mini",
+  "system_prompt": "You are a strict eval judge. Return only the requested JSON.",
+  "timeout_ms": 30000
+}
+```
+
+The eval definition selects that judge service and defines the rubric:
+
+```json
+{
+  "id": "quality.helpful_summary",
+  "group": "quality",
+  "description": "Grades whether a summary is useful, accurate, and concise.",
+  "dataset_path": "data/quality/helpful_summary/test.jsonl",
+  "split": "test",
+  "matcher": {
+    "kind": "model_grade",
+    "judge_service": "judge",
+    "judge_model": "gpt-4.1-mini",
+    "rubric": "Grade from 0 to 1. Passing answers are accurate, complete, and concise.",
+    "pass_score": 0.8
+  },
+  "default_run_count": 1,
+  "service_allowlist": ["local-product", "product-staging"]
+}
+```
+
+The judge must return JSON only:
+
+```json
+{"score":0.9,"passed":true,"reason":"Covers the required points concisely."}
+```
+
+Use `service_allowlist` to keep the eval targeted at product services. The
+judge service can still be used for grading even when it is not in the
+allowlist.
+
+## 5. Run From The CLI
 
 List services and evals:
 
@@ -135,7 +186,7 @@ with OpenAI-style chat completions.
 Text output prints progress lines during parallel runs. JSON output suppresses
 progress so stdout remains machine-readable.
 
-## 5. Wire The Library From Zig
+## 6. Wire The Library From Zig
 
 The CLI is the easiest path, but library users can still call the same modules
 directly.
@@ -199,5 +250,6 @@ pub fn runProductEvals(allocator: std.mem.Allocator) !void {
 
 - Service calls must target an OpenAI-compatible chat-completions endpoint.
 - JSON field matching checks root-level fields only.
+- Model-graded evals require one extra judge model call per candidate output.
 - Streaming, tool-calling, multimodal evals, and advanced significance testing
   are out of scope for v1.

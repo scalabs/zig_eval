@@ -103,6 +103,18 @@ The judge is instructed to return JSON only:
 {"score":0.0,"passed":false,"reason":"short explanation"}
 ```
 
+Judge response fields:
+
+| Field | Required | Meaning |
+| --- | --- | --- |
+| `score` | yes | Numeric grade between `0` and `1`. |
+| `passed` | yes | Judge's pass/fail decision. The runner also requires `score >= pass_score`. |
+| `reason` | yes | Short explanation stored as the failure reason when the eval fails. |
+
+For model-graded evals, `service_allowlist` should usually list only product
+services. The judge service is selected by `matcher.judge_service` or
+`--judge-service` and does not need to be in the allowlist.
+
 ## Dataset Case
 
 Datasets are newline-delimited JSON. Each non-empty line is one case.
