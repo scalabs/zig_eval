@@ -568,9 +568,10 @@ test "example eval registry loads definitions and datasets" {
     );
     defer loaded.deinit();
 
-    try std.testing.expectEqual(@as(usize, 2), loaded.items.len);
+    try std.testing.expectEqual(@as(usize, 3), loaded.items.len);
 
     var saw_smoke = false;
+    var saw_quality = false;
     var saw_structured_output = false;
     var total_cases: usize = 0;
 
@@ -579,6 +580,12 @@ test "example eval registry loads definitions and datasets" {
             saw_smoke = true;
             try std.testing.expect(definition.matcher == .exact_match);
             try std.testing.expectEqualStrings("data/smoke/reply_ok/test.jsonl", definition.dataset_path);
+            try std.testing.expectEqual(@as(usize, 2), definition.service_allowlist.?.len);
+        }
+        if (std.mem.eql(u8, definition.id, "quality.helpful_summary")) {
+            saw_quality = true;
+            try std.testing.expect(definition.matcher == .model_grade);
+            try std.testing.expectEqualStrings("judge", definition.matcher.model_grade.judge_service);
             try std.testing.expectEqual(@as(usize, 2), definition.service_allowlist.?.len);
         }
         if (std.mem.eql(u8, definition.id, "structured_output.required_answer_json")) {
@@ -597,6 +604,7 @@ test "example eval registry loads definitions and datasets" {
     }
 
     try std.testing.expect(saw_smoke);
+    try std.testing.expect(saw_quality);
     try std.testing.expect(saw_structured_output);
-    try std.testing.expectEqual(@as(usize, 4), total_cases);
+    try std.testing.expectEqual(@as(usize, 6), total_cases);
 }

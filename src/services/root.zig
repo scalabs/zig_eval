@@ -760,7 +760,7 @@ test "example services registry loads" {
     );
     defer loaded.deinit();
 
-    try std.testing.expectEqual(@as(usize, 2), loaded.items.len);
+    try std.testing.expectEqual(@as(usize, 3), loaded.items.len);
     try std.testing.expectEqualStrings("local-product", loaded.items[0].name);
     try std.testing.expect(loaded.items[0].api_key_env == null);
     try std.testing.expectEqual(@as(u32, 3), loaded.items[0].retry.max_attempts);
@@ -768,4 +768,7 @@ test "example services registry loads" {
     try std.testing.expectEqual(@as(usize, 5), loaded.items[0].retry.retry_on_status.len);
     try std.testing.expectEqualStrings("product-staging", loaded.items[1].name);
     try std.testing.expectEqualStrings("PRODUCT_STAGING_API_KEY", loaded.items[1].api_key_env.?);
+    try std.testing.expectEqualStrings("judge", loaded.items[2].name);
+    try std.testing.expectEqualStrings("OPENAI_API_KEY", loaded.items[2].api_key_env.?);
+    try std.testing.expectEqualStrings("gpt-4.1-mini", loaded.items[2].default_model);
 }

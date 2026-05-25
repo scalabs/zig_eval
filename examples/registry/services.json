@@ -23,5 +23,18 @@
       "backoff_ms": 500,
       "retry_on_status": [429, 500, 502, 503, 504]
     }
+  },
+  {
+    "name": "judge",
+    "base_url": "https://api.openai.com/v1/chat/completions",
+    "api_key_env": "OPENAI_API_KEY",
+    "default_model": "gpt-4.1-mini",
+    "system_prompt": "You are a strict eval judge. Return only the requested JSON.",
+    "timeout_ms": 30000,
+    "retry": {
+      "max_attempts": 3,
+      "backoff_ms": 500,
+      "retry_on_status": [429, 500, 502, 503, 504]
+    }
   }
 ]

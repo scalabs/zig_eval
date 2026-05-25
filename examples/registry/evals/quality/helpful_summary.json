@@ -1,0 +1,16 @@
+{
+  "id": "quality.helpful_summary",
+  "group": "quality",
+  "description": "Uses an LLM judge to grade whether a summary is useful, accurate, and concise.",
+  "dataset_path": "data/quality/helpful_summary/test.jsonl",
+  "split": "test",
+  "matcher": {
+    "kind": "model_grade",
+    "judge_service": "judge",
+    "judge_model": "gpt-4.1-mini",
+    "rubric": "Grade the candidate summary from 0 to 1. A passing summary accurately captures the main product change, avoids unsupported claims, and is concise enough for a release note.",
+    "pass_score": 0.8
+  },
+  "default_run_count": 1,
+  "service_allowlist": ["local-product", "product-staging"]
+}
