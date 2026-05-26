@@ -1,10 +1,13 @@
 const std = @import("std");
+const registry = @import("../registry/root.zig");
+const services = @import("../services/root.zig");
 
 pub const MatcherKind = enum {
     exact_match,
     includes,
     json_fields,
     model_grade,
+    tool_call,
 };
 
 pub const TextMatchOptions = struct {
@@ -23,6 +26,8 @@ pub const ModelGradeMatcherConfig = struct {
     pass_score: f64 = 1.0,
 };
 
+pub const ToolCallMatcherConfig = struct {};
+
 pub const ModelGradePromptInput = struct {
     input: []const u8,
     output: []const u8,
@@ -34,6 +39,7 @@ pub const MatcherConfig = union(MatcherKind) {
     includes: TextMatchOptions,
     json_fields: JsonFieldsMatcherConfig,
     model_grade: ModelGradeMatcherConfig,
+    tool_call: ToolCallMatcherConfig,
 };
 
 pub const MatchOutcome = struct {
@@ -129,6 +135,14 @@ pub fn parseMatcherConfig(
         };
     }
 
+    if (std.mem.eql(u8, kind_text, "tool_call")) {
+       try validateFields(object, &.{ "kind" });
+
+       return .{
+         .tool_call = .{},
+        };
+    }
+
     return error.InvalidMatcherConfig;
 }
 
@@ -137,12 +151,19 @@ pub fn evaluate(
     matcher: MatcherConfig,
     output: []const u8,
     ideal: ?[]const u8,
+    tool_calls: ?[]const services.ToolCall,
+    expected_tool_calls: ?[]const registry.ExpectedToolCall,
 ) !MatchOutcome {
     return switch (matcher) {
         .exact_match => |options| evaluateExactMatch(options, output, ideal),
         .includes => |options| evaluateIncludes(options, output, ideal),
         .json_fields => |config| evaluateJsonFields(allocator, config, output),
         .model_grade => error.ModelGradeRequiresJudge,
+        .tool_call => evaluateToolCalls(
+           allocator,
+           tool_calls,
+           expected_tool_calls,
+        ),
     };
 }
 
@@ -192,6 +213,78 @@ fn evaluateJsonFields(
     for (config.required_fields) |field| {
         if (object.get(field) == null) return failed("missing required json field");
     }
+    return passed();
+}
+
+fn evaluateToolCalls(
+    allocator: std.mem.Allocator,
+    tool_calls: ?[]const services.ToolCall,
+    expected_tool_calls: ?[]const registry.ExpectedToolCall,
+) !MatchOutcome {
+    const expected = expected_tool_calls orelse
+        return failed("missing expected tool calls");
+
+    const actual = tool_calls orelse
+        return failed("missing tool call");
+
+    for (expected) |expected_call| {
+        var matched = false;
+
+        for (actual) |actual_call| {
+            if (!std.mem.eql(u8, expected_call.name, actual_call.name)) {
+                continue;
+            }
+
+            matched = true;
+
+            if (expected_call.arguments_json) |expected_args| {
+                var parsed = std.json.parseFromSlice(
+                    std.json.Value,
+                    allocator,
+                    actual_call.arguments_json,
+                    .{},
+                ) catch {
+                    return failed("invalid arguments json");
+                };
+                defer parsed.deinit();
+
+                const actual_args_object = switch (parsed.value) {
+                    .object => |obj| obj,
+                    else => return failed("arguments json is not object"),
+                };
+
+                var expected_parsed = std.json.parseFromSlice(
+                    std.json.Value,
+                    allocator,
+                    expected_args,
+                    .{},
+                ) catch {
+                    return failed("invalid expected arguments json");
+                };
+                defer expected_parsed.deinit();
+
+                const expected_object = switch (expected_parsed.value) {
+                    .object => |obj| obj,
+                    else => return failed("expected arguments json is not object"),
+                };
+
+                var iter = expected_object.iterator();
+
+                while (iter.next()) |entry| {
+                    if (actual_args_object.get(entry.key_ptr.*) == null) {
+                        return failed("missing expected argument field");
+                    }
+                }
+            }
+
+            break;
+        }
+
+        if (!matched) {
+            return failed("wrong tool name");
+        }
+    }
+
     return passed();
 }
 
@@ -387,7 +480,7 @@ test "parseMatcherConfig parses all matcher kinds" {
 
         const config = try parseMatcherConfig(arena.allocator(), parsed.value);
         switch (config) {
-            .exact_match, .includes, .json_fields, .model_grade => {},
+            .exact_match, .includes, .json_fields, .model_grade => {}, .tool_call => {},
         }
     }
 }
@@ -517,6 +610,8 @@ test "evaluate exact_match passes with trimming" {
         .{ .exact_match = .{ .case_sensitive = true, .trim_whitespace = true } },
         " OK\n",
         "OK",
+        null,
+        null,
     );
 
     try std.testing.expect(outcome.passed);
@@ -529,12 +624,16 @@ test "evaluate exact_match honors case sensitivity" {
         .{ .exact_match = .{ .case_sensitive = true, .trim_whitespace = true } },
         "ok",
         "OK",
+        null,
+        null,
     );
     const insensitive = try evaluate(
         std.testing.allocator,
         .{ .exact_match = .{ .case_sensitive = false, .trim_whitespace = true } },
         "ok",
         "OK",
+        null,
+        null,
     );
 
     try std.testing.expect(!sensitive.passed);
@@ -547,6 +646,8 @@ test "evaluate includes honors case and trimming options" {
         .{ .includes = .{ .case_sensitive = false, .trim_whitespace = true } },
         "  Product is READY.  ",
         "ready",
+        null,
+        null,
     );
 
     try std.testing.expect(outcome.passed);
@@ -557,6 +658,8 @@ test "evaluate text matchers fail with missing ideal" {
         std.testing.allocator,
         .{ .exact_match = .{} },
         "OK",
+        null,
+        null,
         null,
     );
 
@@ -571,6 +674,8 @@ test "evaluate json_fields passes when required fields exist" {
         .{ .json_fields = .{ .required_fields = fields[0..] } },
         "{\"answer\":\"OK\",\"score\":1}",
         null,
+        null,
+        null,
     );
 
     try std.testing.expect(outcome.passed);
@@ -582,6 +687,8 @@ test "evaluate json_fields fails for invalid JSON" {
         std.testing.allocator,
         .{ .json_fields = .{ .required_fields = fields[0..] } },
         "not json",
+        null,
+        null,
         null,
     );
 
@@ -595,6 +702,8 @@ test "evaluate json_fields fails when required field is missing" {
         std.testing.allocator,
         .{ .json_fields = .{ .required_fields = fields[0..] } },
         "{\"answer\":\"OK\"}",
+        null,
+        null,
         null,
     );
 
@@ -615,6 +724,124 @@ test "evaluate model_grade requires judge execution" {
             },
             "candidate",
             null,
+            null,
+            null,
         ),
     );
+}
+
+test "evaluate tool_call passes with matching tool name and args" {
+    const actual_calls = [_]services.ToolCall{
+        .{
+            .name = "search_web",
+            .arguments_json = "{\"query\":\"weather melbourne\"}",
+        },
+    };
+
+    const expected_calls = [_]registry.ExpectedToolCall{
+        .{
+            .name = "search_web",
+            .arguments_json = "{\"query\":\"x\"}",
+        },
+    };
+
+    const outcome = try evaluate(
+        std.testing.allocator,
+        .{
+            .tool_call = .{},
+        },
+        "",
+        null,
+        actual_calls[0..],
+        expected_calls[0..],
+    );
+
+    try std.testing.expect(outcome.passed);
+}
+
+test "evaluate tool_call fails for wrong tool name" {
+    const actual_calls = [_]services.ToolCall{
+        .{
+            .name = "lookup_weather",
+            .arguments_json = "{\"query\":\"weather melbourne\"}",
+        },
+    };
+
+    const expected_calls = [_]registry.ExpectedToolCall{
+        .{
+            .name = "search_web",
+            .arguments_json = "{\"query\":\"x\"}",
+        },
+    };
+
+    const outcome = try evaluate(
+        std.testing.allocator,
+        .{
+            .tool_call = .{},
+        },
+        "",
+        null,
+        actual_calls[0..],
+        expected_calls[0..],
+    );
+
+    try std.testing.expect(!outcome.passed);
+}
+
+test "evaluate tool_call fails for invalid arguments json" {
+    const actual_calls = [_]services.ToolCall{
+        .{
+            .name = "search_web",
+            .arguments_json = "{invalid json}",
+        },
+    };
+
+    const expected_calls = [_]registry.ExpectedToolCall{
+        .{
+            .name = "search_web",
+            .arguments_json = "{\"query\":\"x\"}",
+        },
+    };
+
+    const outcome = try evaluate(
+        std.testing.allocator,
+        .{
+            .tool_call = .{},
+        },
+        "",
+        null,
+        actual_calls[0..],
+        expected_calls[0..],
+    );
+
+    try std.testing.expect(!outcome.passed);
+}
+
+test "evaluate tool_call fails for missing expected argument field" {
+    const actual_calls = [_]services.ToolCall{
+        .{
+            .name = "search_web",
+            .arguments_json = "{\"location\":\"melbourne\"}",
+        },
+    };
+
+    const expected_calls = [_]registry.ExpectedToolCall{
+        .{
+            .name = "search_web",
+            .arguments_json = "{\"query\":\"x\"}",
+        },
+    };
+
+    const outcome = try evaluate(
+        std.testing.allocator,
+        .{
+            .tool_call = .{},
+        },
+        "",
+        null,
+        actual_calls[0..],
+        expected_calls[0..],
+    );
+
+    try std.testing.expect(!outcome.passed);
 }

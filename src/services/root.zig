@@ -1,4 +1,5 @@
 const std = @import("std");
+const registry = @import("../registry/root.zig");
 
 const max_file_bytes = 1024 * 1024;
 
@@ -35,6 +36,12 @@ pub const ChatCallInput = struct {
     prompt: []const u8,
     system_prompt_override: ?[]const u8 = null,
     model_override: ?[]const u8 = null,
+    tools: ?[]const registry.ToolDefinition = null,
+};
+
+pub const ToolCall = struct {
+    name: []const u8,
+    arguments_json: []const u8,
 };
 
 pub const ChatCallOutput = struct {
@@ -43,6 +50,7 @@ pub const ChatCallOutput = struct {
     status_code: u16,
     attempt_count: u32 = 1,
     retried: bool = false,
+    tool_calls: ?[]const ToolCall = null,
 
     pub fn deinit(self: *ChatCallOutput, allocator: std.mem.Allocator) void {
         allocator.free(self.content);
@@ -125,6 +133,7 @@ pub fn callChatCompletion(
         input.prompt,
         system_prompt,
         service.provider,
+        input.tools,
     );
     defer allocator.free(payload);
 
@@ -296,6 +305,7 @@ fn renderChatPayloadJsonAlloc(
     prompt: []const u8,
     system_prompt: ?[]const u8,
     provider: ?[]const u8,
+    tools: ?[]const registry.ToolDefinition,
 ) ![]u8 {
     var out = std.Io.Writer.Allocating.init(allocator);
     errdefer out.deinit();
@@ -318,6 +328,44 @@ fn renderChatPayloadJsonAlloc(
     }
     try writeMessageObject(&json_writer, "user", prompt);
     try json_writer.endArray();
+
+    if (tools) |tool_list| {
+       try json_writer.objectField("tools");
+       try json_writer.beginArray();
+
+       for (tool_list) |tool| {
+          try json_writer.beginObject();
+
+          try json_writer.objectField("type");
+          try json_writer.write("function");
+
+          try json_writer.objectField("function");
+          try json_writer.beginObject();
+
+          try json_writer.objectField("name");
+          try json_writer.write(tool.name);
+
+          try json_writer.objectField("description");
+          try json_writer.write(tool.description);
+
+          try json_writer.objectField("parameters");
+
+          var parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            allocator,
+            tool.parameters_json,
+            .{},
+          );
+          defer parsed.deinit();
+
+          try json_writer.write(parsed.value);
+
+          try json_writer.endObject();
+          try json_writer.endObject();
+        }
+
+        try json_writer.endArray();
+    }
 
     try json_writer.objectField("stream");
     try json_writer.write(false);
@@ -345,6 +393,57 @@ fn writeMessageObject(
     try json_writer.objectField("content");
     try json_writer.write(content);
     try json_writer.endObject();
+}
+
+fn parseToolCalls(
+    allocator: std.mem.Allocator,
+    message_object: std.json.ObjectMap,
+) !?[]const ToolCall {
+    const tool_calls_value = message_object.get("tool_calls") orelse return null;
+
+    const tool_calls_array = switch (tool_calls_value) {
+        .array => |array| array.items,
+        else => return error.MalformedSuccessPayload,
+    };
+
+    var items = std.ArrayList(ToolCall){};
+    defer items.deinit(allocator);
+
+    for (tool_calls_array) |entry| {
+        const entry_object = switch (entry) {
+            .object => |object| object,
+            else => return error.MalformedSuccessPayload,
+        };
+
+        const function_value = entry_object.get("function") orelse
+            return error.MalformedSuccessPayload;
+
+        const function_object = switch (function_value) {
+            .object => |object| object,
+            else => return error.MalformedSuccessPayload,
+        };
+
+        const name = switch (function_object.get("name") orelse
+            return error.MalformedSuccessPayload)
+        {
+            .string => |value| value,
+            else => return error.MalformedSuccessPayload,
+        };
+
+        const arguments_json = switch (function_object.get("arguments") orelse
+            return error.MalformedSuccessPayload)
+        {
+            .string => |value| value,
+            else => return error.MalformedSuccessPayload,
+        };
+
+        try items.append(allocator, .{
+            .name = try allocator.dupe(u8, name),
+            .arguments_json = try allocator.dupe(u8, arguments_json),
+        });
+    }
+
+    return try allocator.dupe(ToolCall, items.items);
 }
 
 fn parseChatCompletionResponse(
@@ -393,15 +492,24 @@ fn parseChatCompletionResponse(
         else => return error.MalformedSuccessPayload,
     };
 
-    const content = switch (message_object.get("content") orelse return error.MalformedSuccessPayload) {
-        .string => |value| value,
-        else => return error.MalformedSuccessPayload,
-    };
+    const tool_calls = try parseToolCalls(allocator, message_object);
+
+    const content = if (message_object.get("content")) |content_value|
+       switch (content_value) {
+          .string => |value| value,
+          .null => "",
+          else => return error.MalformedSuccessPayload,
+        }
+    else if (tool_calls != null)
+        ""
+    else
+       return error.MalformedSuccessPayload;
 
     return .{
         .content = try allocator.dupe(u8, content),
         .model = try allocator.dupe(u8, model),
         .status_code = @intFromEnum(status),
+        .tool_calls = tool_calls,
     };
 }
 
@@ -669,6 +777,7 @@ test "renderChatPayloadJsonAlloc includes messages stream and provider" {
         "Reply with OK",
         "Follow instructions exactly.",
         "openai",
+        null,
     );
     defer std.testing.allocator.free(payload);
 
@@ -771,4 +880,101 @@ test "example services registry loads" {
     try std.testing.expectEqualStrings("judge", loaded.items[2].name);
     try std.testing.expectEqualStrings("OPENAI_API_KEY", loaded.items[2].api_key_env.?);
     try std.testing.expectEqualStrings("gpt-4.1-mini", loaded.items[2].default_model);
+}
+
+test "renderChatPayloadJsonAlloc includes tools" {
+    const tools = [_]registry.ToolDefinition{
+        .{
+            .name = "search_web",
+            .description = "Search the web",
+            .parameters_json =
+                "{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"}}}",
+        },
+    };
+
+    const payload = try renderChatPayloadJsonAlloc(
+        std.testing.allocator,
+        "gpt-4.1-mini",
+        "Search weather",
+        null,
+        "openai",
+        tools[0..],
+    );
+    defer std.testing.allocator.free(payload);
+
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        payload,
+        .{},
+    );
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+
+    const tool_array = root.get("tools").?.array.items;
+
+    try std.testing.expectEqual(@as(usize, 1), tool_array.len);
+
+    const tool = tool_array[0].object;
+
+    try std.testing.expectEqualStrings(
+        "function",
+        tool.get("type").?.string,
+    );
+
+    const function = tool.get("function").?.object;
+
+    try std.testing.expectEqualStrings(
+        "search_web",
+        function.get("name").?.string,
+    );
+}
+
+test "parseChatCompletionResponse parses tool calls" {
+    const raw =
+        \\{
+        \\  "choices": [
+        \\    {
+        \\      "message": {
+        \\        "content": null,
+        \\        "tool_calls": [
+        \\          {
+        \\            "function": {
+        \\              "name": "search_web",
+        \\              "arguments": "{\"query\":\"weather melbourne\"}"
+        \\            }
+        \\          }
+        \\        ]
+        \\      }
+        \\    }
+        \\  ]
+        \\}
+    ;
+
+    var output = try parseChatCompletionResponse(
+        std.testing.allocator,
+        .ok,
+        raw,
+        "gpt-4.1-mini",
+    );
+    defer output.deinit(std.testing.allocator);
+    defer if (output.tool_calls) |calls| {
+       for (calls) |call| {
+           std.testing.allocator.free(call.name);
+           std.testing.allocator.free(call.arguments_json);
+        }
+        std.testing.allocator.free(calls);
+    };
+
+    try std.testing.expect(output.tool_calls != null);
+
+    const calls = output.tool_calls.?;
+
+    try std.testing.expectEqual(@as(usize, 1), calls.len);
+
+    try std.testing.expectEqualStrings(
+        "search_web",
+        calls[0].name,
+    );
 }

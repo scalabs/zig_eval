@@ -13,12 +13,25 @@ pub const EvalDefinition = struct {
     matcher: matchers.MatcherConfig,
     default_run_count: u32,
     service_allowlist: ?[]const []const u8 = null,
+    tools: ?[]const ToolDefinition = null,
 };
 
 pub const EvalCase = struct {
     id: []const u8,
     input: []const u8,
     ideal: ?[]const u8 = null,
+    expected_tool_calls: ?[]const ExpectedToolCall = null,
+};
+
+pub const ToolDefinition = struct {
+    name: []const u8,
+    description: []const u8,
+    parameters_json: []const u8,
+};
+
+pub const ExpectedToolCall = struct {
+    name: []const u8,
+    arguments_json: ?[]const u8 = null,
 };
 
 pub const LoadedEvalDefinition = struct {
@@ -219,6 +232,7 @@ fn parseEvalDefinition(
         .matcher = try parseRequiredMatcher(allocator, object),
         .default_run_count = default_run_count,
         .service_allowlist = try parseOptionalStringList(allocator, object, "service_allowlist"),
+        .tools = try parseOptionalTools(allocator, object, "tools"),
     };
 }
 
@@ -235,6 +249,11 @@ fn parseEvalCase(
         .id = try dupRequiredString(allocator, object, "id"),
         .input = try dupRequiredString(allocator, object, "input"),
         .ideal = try dupOptionalString(allocator, object, "ideal"),
+        .expected_tool_calls = try parseOptionalExpectedToolCalls(
+            allocator,
+            object,
+            "expected_tool_calls",
+        ),
     };
 }
 
@@ -246,6 +265,67 @@ fn parseRequiredMatcher(
     return matchers.parseMatcherConfig(allocator, value) catch {
         return error.InvalidEvalDefinition;
     };
+}
+
+fn parseOptionalTools(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+    field_name: []const u8,
+) !?[]const ToolDefinition {
+    const value = object.get(field_name) orelse return null;
+
+    const array = switch (value) {
+        .array => |array| array,
+        else => return error.InvalidEvalDefinition,
+    };
+
+    var items = std.ArrayList(ToolDefinition){};
+    defer items.deinit(allocator);
+
+    for (array.items) |item| {
+        const tool_object = switch (item) {
+            .object => |obj| obj,
+            else => return error.InvalidEvalDefinition,
+        };
+
+        try items.append(allocator, .{
+            .name = try dupRequiredString(allocator, tool_object, "name"),
+            .description = try dupRequiredString(allocator, tool_object, "description"),
+            .parameters_json = try dupRequiredString(allocator, tool_object, "parameters_json"),
+        });
+    }
+
+    return try allocator.dupe(ToolDefinition, items.items);
+}
+
+fn parseOptionalExpectedToolCalls(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+    field_name: []const u8,
+) !?[]const ExpectedToolCall {
+    const value = object.get(field_name) orelse return null;
+
+    const array = switch (value) {
+        .array => |array| array,
+        else => return error.InvalidEvalCase,
+    };
+
+    var items = std.ArrayList(ExpectedToolCall){};
+    defer items.deinit(allocator);
+
+    for (array.items) |item| {
+        const call_object = switch (item) {
+            .object => |obj| obj,
+            else => return error.InvalidEvalCase,
+        };
+
+        try items.append(allocator, .{
+            .name = try dupRequiredString(allocator, call_object, "name"),
+            .arguments_json = try dupOptionalString(allocator, call_object, "arguments_json"),
+        });
+    }
+
+    return try allocator.dupe(ExpectedToolCall, items.items);
 }
 
 fn dupRequiredString(

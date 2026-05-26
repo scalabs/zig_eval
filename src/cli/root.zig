@@ -177,8 +177,10 @@ fn evaluateMatcher(
     matcher: matchers.MatcherConfig,
     output: []const u8,
     ideal: ?[]const u8,
+    tool_calls: ?[]const services.ToolCall,
+    expected_tool_calls: ?[]const registry.ExpectedToolCall,
 ) anyerror!runner.MatcherOutcome {
-    const outcome = try matchers.evaluate(allocator, matcher, output, ideal);
+    const outcome = try matchers.evaluate(allocator, matcher, output, ideal,tool_calls,expected_tool_calls);
     return .{
         .passed = outcome.passed,
         .score = outcome.score,

@@ -39,6 +39,8 @@ pub const MatcherEvaluator = *const fn (
     matcher: matchers.MatcherConfig,
     output: []const u8,
     ideal: ?[]const u8,
+    tool_calls: ?[]const services.ToolCall,
+    expected_tool_calls: ?[]const registry.ExpectedToolCall,
 ) anyerror!MatcherOutcome;
 
 pub const RunnerOptions = struct {
@@ -329,10 +331,17 @@ fn collectEvalTasks(
                         .eval_definition = eval_definition,
                         .service = service,
                         .case = .{
-                            .id = try arena_allocator.dupe(u8, case.id),
-                            .input = try arena_allocator.dupe(u8, case.input),
-                            .ideal = if (case.ideal) |ideal| try arena_allocator.dupe(u8, ideal) else null,
-                        },
+                                   .id = try arena_allocator.dupe(u8, case.id),
+                                   .input = try arena_allocator.dupe(u8, case.input),
+                                   .ideal = if (case.ideal) |ideal|
+                                        try arena_allocator.dupe(u8, ideal)
+                                    else
+                                        null,
+                                    .expected_tool_calls = if (case.expected_tool_calls) |calls|
+                                        try arena_allocator.dupe(registry.ExpectedToolCall, calls)
+                                    else
+                                        null,
+                                },
                         .run_index = run_index,
                     });
                 }
@@ -354,7 +363,10 @@ fn runOneCase(
     case: registry.EvalCase,
     run_index: u32,
 ) !void {
-    const input = services.ChatCallInput{ .prompt = case.input };
+    const input = services.ChatCallInput{ 
+       .prompt = case.input,
+       .tools = eval_definition.tools, 
+    };
     const started_at = std.time.milliTimestamp();
 
     var output = options.service_caller(temp_allocator, service, input) catch |err| {
@@ -385,6 +397,8 @@ fn runOneCase(
         case.input,
         output.content,
         case.ideal,
+        output.tool_calls,
+        case.expected_tool_calls,
     ) catch |err| MatcherOutcome{
         .passed = false,
         .score = 0.0,
@@ -419,10 +433,19 @@ fn evaluateRunMatcher(
     input: []const u8,
     output: []const u8,
     ideal: ?[]const u8,
+    tool_calls: ?[]const services.ToolCall,
+    expected_tool_calls: ?[]const registry.ExpectedToolCall,
 ) !MatcherOutcome {
     return switch (matcher) {
         .model_grade => |config| evaluateModelGradeMatcher(allocator, options, config, input, output, ideal),
-        else => options.matcher_evaluator(allocator, matcher, output, ideal),
+        else => options.matcher_evaluator(
+           allocator,
+           matcher,
+           output,
+           ideal,
+           tool_calls,
+           expected_tool_calls,
+        ),
     };
 }
 
@@ -1084,7 +1107,11 @@ fn fakeMatcherPass(
     matcher: matchers.MatcherConfig,
     output: []const u8,
     ideal: ?[]const u8,
+    tool_calls: ?[]const services.ToolCall,
+    expected_tool_calls: ?[]const registry.ExpectedToolCall,
 ) anyerror!MatcherOutcome {
+    _ = tool_calls;
+    _ = expected_tool_calls;
     _ = allocator;
     _ = matcher;
     _ = output;
