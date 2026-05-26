@@ -1,0 +1,1 @@
+{"id":"case-1","input":"Search the web for the weather in Melbourne.","expected_tool_calls":[{"name":"search_web","arguments_json":"{\"query\":\"weather melbourne\"}"}]}

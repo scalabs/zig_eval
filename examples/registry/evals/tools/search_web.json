@@ -1,0 +1,19 @@
+{
+  "id": "tools.search_web",
+  "group": "tools",
+  "description": "Checks that the product chooses the search_web tool with a query argument.",
+  "dataset_path": "data/tools/search_web/test.jsonl",
+  "split": "test",
+  "tools": [
+    {
+      "name": "search_web",
+      "description": "Search the web for current information.",
+      "parameters_json": "{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"}},\"required\":[\"query\"]}"
+    }
+  ],
+  "matcher": {
+    "kind": "tool_call"
+  },
+  "default_run_count": 1,
+  "service_allowlist": ["local-product"]
+}

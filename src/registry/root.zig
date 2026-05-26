@@ -648,7 +648,7 @@ test "example eval registry loads definitions and datasets" {
     );
     defer loaded.deinit();
 
-    try std.testing.expectEqual(@as(usize, 3), loaded.items.len);
+    try std.testing.expectEqual(@as(usize, 4), loaded.items.len);
 
     var saw_smoke = false;
     var saw_quality = false;
@@ -686,5 +686,89 @@ test "example eval registry loads definitions and datasets" {
     try std.testing.expect(saw_smoke);
     try std.testing.expect(saw_quality);
     try std.testing.expect(saw_structured_output);
-    try std.testing.expectEqual(@as(usize, 6), total_cases);
+    try std.testing.expectEqual(@as(usize, 7), total_cases);
 }
+
+test "parseEvalDefinition supports tool definitions" {
+    const json =
+        \\{
+        \\  "id": "tools.search_web",
+        \\  "group": "tools",
+        \\  "description": "tool eval",
+        \\  "dataset_path": "data/tools/search_web/test.jsonl",
+        \\  "split": "test",
+        \\  "tools": [
+        \\    {
+        \\      "name": "search_web",
+        \\      "description": "Search the web",
+        \\      "parameters_json": "{\"type\":\"object\"}"
+        \\    }
+        \\  ],
+        \\  "matcher": {
+        \\    "kind": "tool_call"
+        \\  },
+        \\  "default_run_count": 1
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parsed_json = try std.json.parseFromSlice(
+        std.json.Value,
+        arena.allocator(),
+        json,
+        .{},
+    );
+    defer parsed_json.deinit();
+
+    const parsed = try parseEvalDefinition(
+        arena.allocator(),
+        parsed_json.value,
+    );
+
+    try std.testing.expect(parsed.tools != null);
+
+    const tools = parsed.tools.?;
+
+    try std.testing.expectEqual(@as(usize, 1), tools.len);
+    try std.testing.expectEqualStrings("search_web", tools[0].name);
+}
+
+test "parseEvalCase supports expected tool calls" {
+    const json =
+        \\{
+        \\  "id": "case-1",
+        \\  "input": "Search weather",
+        \\  "expected_tool_calls": [
+        \\    {
+        \\      "name": "search_web",
+        \\      "arguments_json": "{\"query\":\"weather melbourne\"}"
+        \\    }
+        \\  ]
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parsed_json = try std.json.parseFromSlice(
+        std.json.Value,
+        arena.allocator(),
+        json,
+        .{},
+    );
+    defer parsed_json.deinit();
+
+    const parsed = try parseEvalCase(
+        arena.allocator(),
+        parsed_json.value,
+    );
+
+    try std.testing.expect(parsed.expected_tool_calls != null);
+
+    const calls = parsed.expected_tool_calls.?;
+
+    try std.testing.expectEqual(@as(usize, 1), calls.len);
+    try std.testing.expectEqualStrings("search_web", calls[0].name);
+}    
