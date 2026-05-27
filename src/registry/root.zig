@@ -3,6 +3,7 @@ const matchers = @import("../matchers/root.zig");
 
 const max_eval_file_bytes = 1024 * 1024;
 const max_dataset_file_bytes = 8 * 1024 * 1024;
+pub const max_attachment_bytes = 5 * 1024 * 1024;
 
 pub const EvalDefinition = struct {
     id: []const u8,
@@ -21,6 +22,19 @@ pub const EvalCase = struct {
     input: []const u8,
     ideal: ?[]const u8 = null,
     expected_tool_calls: ?[]const ExpectedToolCall = null,
+    attachments: ?[]const Attachment = null,
+};
+
+pub const AttachmentKind = enum {
+    image,
+    file,
+};
+
+pub const Attachment = struct {
+    kind: AttachmentKind,
+    path: []const u8,
+    mime_type: ?[]const u8 = null,
+    label: ?[]const u8 = null,
 };
 
 pub const ToolDefinition = struct {
@@ -171,7 +185,9 @@ pub fn loadEvalCases(
         };
         defer parsed.deinit();
 
-        try items.append(allocator, try parseEvalCase(arena.allocator(), parsed.value));
+        const eval_case = try parseEvalCase(arena.allocator(), parsed.value);
+        try validateEvalCaseAttachments(dir, eval_case);
+        try items.append(allocator, eval_case);
     }
 
     return .{
@@ -254,6 +270,7 @@ fn parseEvalCase(
             object,
             "expected_tool_calls",
         ),
+        .attachments = try parseOptionalAttachments(allocator, object, "attachments"),
     };
 }
 
@@ -344,6 +361,97 @@ fn parseOptionalExpectedToolCalls(
     }
 
     return try allocator.dupe(ExpectedToolCall, items.items);
+}
+
+fn parseOptionalAttachments(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+    field_name: []const u8,
+) !?[]const Attachment {
+    const value = object.get(field_name) orelse return null;
+
+    const array = switch (value) {
+        .array => |array| array,
+        else => return error.InvalidEvalCase,
+    };
+
+    var items = std.ArrayList(Attachment){};
+    defer items.deinit(allocator);
+
+    for (array.items) |item| {
+        const attachment_object = switch (item) {
+            .object => |obj| obj,
+            else => return error.InvalidEvalCase,
+        };
+
+        const path = try dupRequiredString(allocator, attachment_object, "path");
+        try validateAttachmentPath(path);
+
+        const mime_type = try dupOptionalString(allocator, attachment_object, "mime_type");
+        if (mime_type == null and inferAttachmentMimeType(path) == null) {
+            return error.UnsupportedAttachmentType;
+        }
+
+        try items.append(allocator, .{
+            .kind = try parseAttachmentKind(attachment_object),
+            .path = path,
+            .mime_type = mime_type,
+            .label = try dupOptionalString(allocator, attachment_object, "label"),
+        });
+    }
+
+    return try allocator.dupe(Attachment, items.items);
+}
+
+fn parseAttachmentKind(object: std.json.ObjectMap) !AttachmentKind {
+    const value = object.get("kind") orelse return error.InvalidEvalCase;
+    const text = switch (value) {
+        .string => |text| std.mem.trim(u8, text, " \t\r\n"),
+        else => return error.InvalidEvalCase,
+    };
+    if (std.mem.eql(u8, text, "image")) return .image;
+    if (std.mem.eql(u8, text, "file")) return .file;
+    return error.InvalidEvalCase;
+}
+
+fn validateEvalCaseAttachments(dir: std.fs.Dir, eval_case: EvalCase) !void {
+    const attachments = eval_case.attachments orelse return;
+    for (attachments) |attachment| {
+        const stat = dir.statFile(attachment.path) catch |err| switch (err) {
+            error.FileNotFound => return error.MissingAttachmentFile,
+            else => return err,
+        };
+        if (stat.size > max_attachment_bytes) return error.AttachmentTooLarge;
+    }
+}
+
+fn validateAttachmentPath(path: []const u8) !void {
+    if (std.fs.path.isAbsolute(path)) return error.InvalidAttachmentPath;
+    var parts = std.mem.splitAny(u8, path, "/\\");
+    while (parts.next()) |part| {
+        if (part.len == 0) return error.InvalidAttachmentPath;
+        if (std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) {
+            return error.InvalidAttachmentPath;
+        }
+    }
+}
+
+pub fn inferAttachmentMimeType(path: []const u8) ?[]const u8 {
+    const extension = std.fs.path.extension(path);
+    if (std.ascii.eqlIgnoreCase(extension, ".png")) return "image/png";
+    if (std.ascii.eqlIgnoreCase(extension, ".jpg")) return "image/jpeg";
+    if (std.ascii.eqlIgnoreCase(extension, ".jpeg")) return "image/jpeg";
+    if (std.ascii.eqlIgnoreCase(extension, ".webp")) return "image/webp";
+    if (std.ascii.eqlIgnoreCase(extension, ".txt")) return "text/plain";
+    if (std.ascii.eqlIgnoreCase(extension, ".md")) return "text/markdown";
+    if (std.ascii.eqlIgnoreCase(extension, ".json")) return "application/json";
+    if (std.ascii.eqlIgnoreCase(extension, ".jsonl")) return "application/x-ndjson";
+    if (std.ascii.eqlIgnoreCase(extension, ".csv")) return "text/csv";
+    if (std.ascii.eqlIgnoreCase(extension, ".zig")) return "text/plain";
+    if (std.ascii.eqlIgnoreCase(extension, ".py")) return "text/x-python";
+    if (std.ascii.eqlIgnoreCase(extension, ".js")) return "text/javascript";
+    if (std.ascii.eqlIgnoreCase(extension, ".ts")) return "text/typescript";
+    return null;
 }
 
 fn dupRequiredString(
@@ -867,4 +975,140 @@ test "parseEvalCase supports expected tool calls" {
 
     try std.testing.expectEqual(@as(usize, 1), calls.len);
     try std.testing.expectEqualStrings("search_web", calls[0].name);
+}
+
+test "parseEvalCase supports file attachments" {
+    const json =
+        \\{
+        \\  "id": "case-1",
+        \\  "input": "Summarize the attachment",
+        \\  "attachments": [
+        \\    {
+        \\      "kind": "file",
+        \\      "path": "assets/changelogs/release.md",
+        \\      "mime_type": "text/markdown",
+        \\      "label": "release notes"
+        \\    }
+        \\  ]
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parsed_json = try std.json.parseFromSlice(
+        std.json.Value,
+        arena.allocator(),
+        json,
+        .{},
+    );
+    defer parsed_json.deinit();
+
+    const parsed = try parseEvalCase(arena.allocator(), parsed_json.value);
+    try std.testing.expect(parsed.attachments != null);
+
+    const attachments = parsed.attachments.?;
+    try std.testing.expectEqual(@as(usize, 1), attachments.len);
+    try std.testing.expectEqual(AttachmentKind.file, attachments[0].kind);
+    try std.testing.expectEqualStrings("assets/changelogs/release.md", attachments[0].path);
+    try std.testing.expectEqualStrings("text/markdown", attachments[0].mime_type.?);
+    try std.testing.expectEqualStrings("release notes", attachments[0].label.?);
+}
+
+test "loadEvalCases validates attachment files" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("assets/changelogs");
+    try tmp.dir.writeFile(.{
+        .sub_path = "assets/changelogs/release.md",
+        .data = "Retry support and parallel execution shipped.\n",
+    });
+    try tmp.dir.writeFile(.{
+        .sub_path = "cases.jsonl",
+        .data = "{\"id\":\"case-1\",\"input\":\"Summarize\",\"attachments\":[{\"kind\":\"file\",\"path\":\"assets/changelogs/release.md\"}]}\n",
+    });
+
+    var loaded = try loadEvalCases(std.testing.allocator, tmp.dir, "cases.jsonl");
+    defer loaded.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), loaded.items.len);
+    try std.testing.expectEqualStrings("text/markdown", inferAttachmentMimeType(loaded.items[0].attachments.?[0].path).?);
+}
+
+test "loadEvalCases rejects missing attachment files" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(.{
+        .sub_path = "cases.jsonl",
+        .data = "{\"id\":\"case-1\",\"input\":\"Summarize\",\"attachments\":[{\"kind\":\"file\",\"path\":\"assets/missing.md\"}]}\n",
+    });
+
+    try std.testing.expectError(
+        error.MissingAttachmentFile,
+        loadEvalCases(std.testing.allocator, tmp.dir, "cases.jsonl"),
+    );
+}
+
+test "parseEvalCase rejects unsafe attachment paths" {
+    const json =
+        \\{
+        \\  "id": "case-1",
+        \\  "input": "Summarize",
+        \\  "attachments": [
+        \\    {
+        \\      "kind": "file",
+        \\      "path": "../secret.txt"
+        \\    }
+        \\  ]
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parsed_json = try std.json.parseFromSlice(
+        std.json.Value,
+        arena.allocator(),
+        json,
+        .{},
+    );
+    defer parsed_json.deinit();
+
+    try std.testing.expectError(
+        error.InvalidAttachmentPath,
+        parseEvalCase(arena.allocator(), parsed_json.value),
+    );
+}
+
+test "parseEvalCase rejects unsupported attachment extension without mime type" {
+    const json =
+        \\{
+        \\  "id": "case-1",
+        \\  "input": "Inspect",
+        \\  "attachments": [
+        \\    {
+        \\      "kind": "file",
+        \\      "path": "assets/archive.zip"
+        \\    }
+        \\  ]
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parsed_json = try std.json.parseFromSlice(
+        std.json.Value,
+        arena.allocator(),
+        json,
+        .{},
+    );
+    defer parsed_json.deinit();
+
+    try std.testing.expectError(
+        error.UnsupportedAttachmentType,
+        parseEvalCase(arena.allocator(), parsed_json.value),
+    );
 }
