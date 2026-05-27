@@ -1,0 +1,14 @@
+{
+  "id": "multimodal.release_notes",
+  "group": "multimodal",
+  "description": "Checks whether a product can use an attached text file as context.",
+  "dataset_path": "data/multimodal/release_notes/test.jsonl",
+  "split": "test",
+  "matcher": {
+    "kind": "includes",
+    "case_sensitive": false,
+    "trim_whitespace": true
+  },
+  "default_run_count": 1,
+  "service_allowlist": ["local-product"]
+}

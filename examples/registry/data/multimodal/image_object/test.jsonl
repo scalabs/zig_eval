@@ -1,0 +1,1 @@
+{"id":"case-1","input":"What object is shown in the attached image?","ideal":"red mug","attachments":[{"kind":"image","path":"assets/images/red_mug.png","mime_type":"image/png","label":"reference image"}]}

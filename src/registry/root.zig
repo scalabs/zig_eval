@@ -774,11 +774,13 @@ test "example eval registry loads definitions and datasets" {
     );
     defer loaded.deinit();
 
-    try std.testing.expectEqual(@as(usize, 4), loaded.items.len);
+    try std.testing.expectEqual(@as(usize, 6), loaded.items.len);
 
     var saw_smoke = false;
     var saw_quality = false;
     var saw_structured_output = false;
+    var saw_multimodal_text = false;
+    var saw_multimodal_image = false;
     var total_cases: usize = 0;
 
     for (loaded.items) |definition| {
@@ -799,6 +801,14 @@ test "example eval registry loads definitions and datasets" {
             try std.testing.expect(definition.matcher == .json_fields);
             try std.testing.expectEqualStrings("answer", definition.matcher.json_fields.required_fields[0]);
         }
+        if (std.mem.eql(u8, definition.id, "multimodal.release_notes")) {
+            saw_multimodal_text = true;
+            try std.testing.expect(definition.matcher == .includes);
+        }
+        if (std.mem.eql(u8, definition.id, "multimodal.image_object")) {
+            saw_multimodal_image = true;
+            try std.testing.expect(definition.matcher == .includes);
+        }
 
         var cases = try loadRegistryEvalCases(
             std.testing.allocator,
@@ -807,12 +817,17 @@ test "example eval registry loads definitions and datasets" {
         );
         defer cases.deinit();
         total_cases += cases.items.len;
+        if (std.mem.startsWith(u8, definition.id, "multimodal.")) {
+            try std.testing.expect(cases.items[0].attachments != null);
+        }
     }
 
     try std.testing.expect(saw_smoke);
     try std.testing.expect(saw_quality);
     try std.testing.expect(saw_structured_output);
-    try std.testing.expectEqual(@as(usize, 7), total_cases);
+    try std.testing.expect(saw_multimodal_text);
+    try std.testing.expect(saw_multimodal_image);
+    try std.testing.expectEqual(@as(usize, 9), total_cases);
 }
 
 test "parseEvalDefinition supports tool definitions" {

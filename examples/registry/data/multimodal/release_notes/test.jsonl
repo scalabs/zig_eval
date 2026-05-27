@@ -1,0 +1,1 @@
+{"id":"case-1","input":"Summarize the attached product changelog in one sentence.","ideal":"Mentions retry configuration, bounded parallel execution, and retry metadata.","attachments":[{"kind":"file","path":"assets/changelogs/release.md","mime_type":"text/markdown","label":"release notes"}]}
