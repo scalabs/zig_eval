@@ -224,6 +224,7 @@ fn validateDatasetPath(
     dir: std.fs.Dir,
     dataset_path: []const u8,
 ) !void {
+    try validateDatasetRelativePath(dataset_path);
     try dir.access(dataset_path, .{});
 }
 
@@ -386,14 +387,17 @@ fn parseOptionalAttachments(
 
         const path = try dupRequiredString(allocator, attachment_object, "path");
         try validateAttachmentPath(path);
+        const kind = try parseAttachmentKind(attachment_object);
 
         const mime_type = try dupOptionalString(allocator, attachment_object, "mime_type");
-        if (mime_type == null and inferAttachmentMimeType(path) == null) {
+        const resolved_mime_type = mime_type orelse inferAttachmentMimeType(path);
+        if (resolved_mime_type == null) {
             return error.UnsupportedAttachmentType;
         }
+        try validateAttachmentKindMime(kind, resolved_mime_type.?);
 
         try items.append(allocator, .{
-            .kind = try parseAttachmentKind(attachment_object),
+            .kind = kind,
             .path = path,
             .mime_type = mime_type,
             .label = try dupOptionalString(allocator, attachment_object, "label"),
@@ -426,14 +430,37 @@ fn validateEvalCaseAttachments(dir: std.fs.Dir, eval_case: EvalCase) !void {
 }
 
 fn validateAttachmentPath(path: []const u8) !void {
-    if (std.fs.path.isAbsolute(path)) return error.InvalidAttachmentPath;
+    if (!isSafeRelativePath(path)) return error.InvalidAttachmentPath;
+}
+
+fn validateDatasetRelativePath(path: []const u8) !void {
+    if (!isSafeRelativePath(path)) return error.InvalidDatasetPath;
+}
+
+fn isSafeRelativePath(path: []const u8) bool {
+    if (std.fs.path.isAbsolute(path)) return false;
     var parts = std.mem.splitAny(u8, path, "/\\");
     while (parts.next()) |part| {
-        if (part.len == 0) return error.InvalidAttachmentPath;
+        if (part.len == 0) return false;
         if (std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) {
-            return error.InvalidAttachmentPath;
+            return false;
         }
     }
+    return true;
+}
+
+fn validateAttachmentKindMime(kind: AttachmentKind, mime_type: []const u8) !void {
+    const image_mime = isImageAttachmentMimeType(mime_type);
+    switch (kind) {
+        .image => if (!image_mime) return error.InvalidAttachmentMimeType,
+        .file => if (image_mime) return error.InvalidAttachmentMimeType,
+    }
+}
+
+fn isImageAttachmentMimeType(mime_type: []const u8) bool {
+    return std.mem.eql(u8, mime_type, "image/png") or
+        std.mem.eql(u8, mime_type, "image/jpeg") or
+        std.mem.eql(u8, mime_type, "image/webp");
 }
 
 pub fn inferAttachmentMimeType(path: []const u8) ?[]const u8 {
@@ -716,6 +743,58 @@ test "loadEvalDefinition rejects missing dataset files" {
 
     try std.testing.expectError(
         error.MissingDatasetFile,
+        loadEvalDefinition(std.testing.allocator, tmp.dir, "registry/evals/smoke/reply_ok.json"),
+    );
+}
+
+test "loadEvalDefinition rejects unsafe dataset paths" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("registry/evals/smoke");
+    try tmp.dir.writeFile(.{
+        .sub_path = "registry/evals/smoke/reply_ok.json",
+        .data =
+        \\{
+        \\  "id": "smoke.reply_ok",
+        \\  "group": "smoke",
+        \\  "description": "Checks a simple OK response.",
+        \\  "dataset_path": "../secret.jsonl",
+        \\  "split": "test",
+        \\  "matcher": { "kind": "exact_match" },
+        \\  "default_run_count": 2
+        \\}
+        ,
+    });
+
+    try std.testing.expectError(
+        error.InvalidDatasetPath,
+        loadEvalDefinition(std.testing.allocator, tmp.dir, "registry/evals/smoke/reply_ok.json"),
+    );
+}
+
+test "loadEvalDefinition rejects absolute dataset paths" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("registry/evals/smoke");
+    try tmp.dir.writeFile(.{
+        .sub_path = "registry/evals/smoke/reply_ok.json",
+        .data =
+        \\{
+        \\  "id": "smoke.reply_ok",
+        \\  "group": "smoke",
+        \\  "description": "Checks a simple OK response.",
+        \\  "dataset_path": "/tmp/secret.jsonl",
+        \\  "split": "test",
+        \\  "matcher": { "kind": "exact_match" },
+        \\  "default_run_count": 2
+        \\}
+        ,
+    });
+
+    try std.testing.expectError(
+        error.InvalidDatasetPath,
         loadEvalDefinition(std.testing.allocator, tmp.dir, "registry/evals/smoke/reply_ok.json"),
     );
 }
@@ -1124,6 +1203,70 @@ test "parseEvalCase rejects unsupported attachment extension without mime type" 
 
     try std.testing.expectError(
         error.UnsupportedAttachmentType,
+        parseEvalCase(arena.allocator(), parsed_json.value),
+    );
+}
+
+test "parseEvalCase rejects image attachment with text mime type" {
+    const json =
+        \\{
+        \\  "id": "case-1",
+        \\  "input": "Inspect",
+        \\  "attachments": [
+        \\    {
+        \\      "kind": "image",
+        \\      "path": "assets/images/red_mug.png",
+        \\      "mime_type": "text/plain"
+        \\    }
+        \\  ]
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parsed_json = try std.json.parseFromSlice(
+        std.json.Value,
+        arena.allocator(),
+        json,
+        .{},
+    );
+    defer parsed_json.deinit();
+
+    try std.testing.expectError(
+        error.InvalidAttachmentMimeType,
+        parseEvalCase(arena.allocator(), parsed_json.value),
+    );
+}
+
+test "parseEvalCase rejects file attachment with image mime type" {
+    const json =
+        \\{
+        \\  "id": "case-1",
+        \\  "input": "Inspect",
+        \\  "attachments": [
+        \\    {
+        \\      "kind": "file",
+        \\      "path": "assets/images/red_mug.png",
+        \\      "mime_type": "image/png"
+        \\    }
+        \\  ]
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parsed_json = try std.json.parseFromSlice(
+        std.json.Value,
+        arena.allocator(),
+        json,
+        .{},
+    );
+    defer parsed_json.deinit();
+
+    try std.testing.expectError(
+        error.InvalidAttachmentMimeType,
         parseEvalCase(arena.allocator(), parsed_json.value),
     );
 }

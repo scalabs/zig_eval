@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const registry = @import("../registry/root.zig");
 
 const max_file_bytes = 1024 * 1024;
@@ -170,13 +171,14 @@ pub fn callChatCompletion(
         var response_writer = std.Io.Writer.Allocating.init(allocator);
         defer response_writer.deinit();
 
-        const fetch_result = client.fetch(.{
-            .location = .{ .uri = uri },
-            .method = .POST,
-            .payload = payload,
-            .extra_headers = headers.items,
-            .response_writer = &response_writer.writer,
-        }) catch |err| {
+        const fetch_result = fetchChatCompletionWithTimeout(
+            &client,
+            uri,
+            payload,
+            headers.items,
+            &response_writer.writer,
+            service.timeout_ms,
+        ) catch |err| {
             if (attempt >= max_attempts) {
                 return err;
             }
@@ -204,6 +206,92 @@ pub fn callChatCompletion(
     }
 
     return error.RetryExhausted;
+}
+
+fn fetchChatCompletionWithTimeout(
+    client: *std.http.Client,
+    uri: std.Uri,
+    payload: []const u8,
+    headers: []const std.http.Header,
+    response_writer: *std.Io.Writer,
+    timeout_ms: u32,
+) !std.http.Client.FetchResult {
+    var req = try client.request(.POST, uri, .{
+        .redirect_behavior = .unhandled,
+        .extra_headers = headers,
+        .keep_alive = false,
+    });
+    defer req.deinit();
+
+    if (req.connection) |connection| {
+        try applyConnectionTimeout(connection, timeout_ms);
+    }
+
+    req.transfer_encoding = .{ .content_length = payload.len };
+    var body = try req.sendBodyUnflushed(&.{});
+    try body.writer.writeAll(payload);
+    try body.end();
+    try req.connection.?.flush();
+
+    var response = try req.receiveHead(&.{});
+
+    const decompress_buffer: []u8 = switch (response.head.content_encoding) {
+        .identity => &.{},
+        .zstd => try client.allocator.alloc(u8, std.compress.zstd.default_window_len),
+        .deflate, .gzip => try client.allocator.alloc(u8, std.compress.flate.max_window_len),
+        .compress => return error.UnsupportedCompressionMethod,
+    };
+    defer if (response.head.content_encoding != .identity) client.allocator.free(decompress_buffer);
+
+    var transfer_buffer: [64]u8 = undefined;
+    var decompress: std.http.Decompress = undefined;
+    const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
+    _ = reader.streamRemaining(response_writer) catch |err| switch (err) {
+        error.ReadFailed => return response.bodyErr().?,
+        else => |e| return e,
+    };
+
+    return .{ .status = response.head.status };
+}
+
+fn applyConnectionTimeout(connection: *std.http.Client.Connection, timeout_ms: u32) !void {
+    if (timeout_ms == 0) return;
+
+    const stream = connection.stream_reader.getStream();
+    try setSocketTimeout(stream.handle, std.posix.SO.RCVTIMEO, timeout_ms);
+    try setSocketTimeout(stream.handle, std.posix.SO.SNDTIMEO, timeout_ms);
+}
+
+fn setSocketTimeout(
+    socket: std.posix.socket_t,
+    optname: u32,
+    timeout_ms: u32,
+) !void {
+    if (builtin.os.tag == .windows) {
+        const value: u32 = timeout_ms;
+        try std.posix.setsockopt(
+            socket,
+            std.posix.SOL.SOCKET,
+            optname,
+            std.mem.asBytes(&value),
+        );
+        return;
+    }
+
+    const value = timeoutMillisToTimeval(timeout_ms);
+    try std.posix.setsockopt(
+        socket,
+        std.posix.SOL.SOCKET,
+        optname,
+        std.mem.asBytes(&value),
+    );
+}
+
+fn timeoutMillisToTimeval(timeout_ms: u32) std.posix.timeval {
+    return .{
+        .sec = @intCast(timeout_ms / 1000),
+        .usec = @intCast((timeout_ms % 1000) * 1000),
+    };
 }
 
 fn parseServiceConfig(
@@ -435,9 +523,10 @@ fn writeUserMessageObject(
 
     for (attachment_list) |attachment| {
         const mime_type = attachmentMimeType(attachment) orelse return error.UnsupportedAttachmentType;
-        if (attachment.kind == .image or isImageMimeType(mime_type)) {
+        if (attachment.kind == .image) {
+            if (!isImageMimeType(mime_type)) return error.UnsupportedAttachmentType;
             try writeImageContentBlock(json_writer, allocator, dir, attachment, mime_type);
-        } else if (!isTextMimeType(mime_type)) {
+        } else if (isImageMimeType(mime_type) or !isTextMimeType(mime_type)) {
             return error.UnsupportedAttachmentType;
         }
     }
@@ -459,8 +548,11 @@ fn buildTextContentWithAttachments(
 
     for (attachments) |attachment| {
         const mime_type = attachmentMimeType(attachment) orelse return error.UnsupportedAttachmentType;
-        if (attachment.kind == .image or isImageMimeType(mime_type)) continue;
-        if (!isTextMimeType(mime_type)) return error.UnsupportedAttachmentType;
+        if (attachment.kind == .image) {
+            if (!isImageMimeType(mime_type)) return error.UnsupportedAttachmentType;
+            continue;
+        }
+        if (isImageMimeType(mime_type) or !isTextMimeType(mime_type)) return error.UnsupportedAttachmentType;
 
         const raw = try dir.readFileAlloc(allocator, attachment.path, registry.max_attachment_bytes);
         defer allocator.free(raw);
@@ -820,6 +912,23 @@ test "ServiceConfig stores v1 fields" {
     try std.testing.expectEqualStrings("product-api", service.name);
     try std.testing.expectEqualStrings("openai", service.provider.?);
     try std.testing.expectEqual(@as(u32, 30_000), service.timeout_ms);
+}
+
+test "timeoutMillisToTimeval converts milliseconds" {
+    const timeout = timeoutMillisToTimeval(1501);
+
+    try std.testing.expectEqual(@as(@TypeOf(timeout.sec), 1), timeout.sec);
+    try std.testing.expectEqual(@as(@TypeOf(timeout.usec), 501000), timeout.usec);
+}
+
+test "setSocketTimeout applies send and receive timeout options" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const socket = try std.posix.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+    defer std.posix.close(socket);
+
+    try setSocketTimeout(socket, std.posix.SO.RCVTIMEO, 25);
+    try setSocketTimeout(socket, std.posix.SO.SNDTIMEO, 25);
 }
 
 test "loadServices loads valid services.json" {
@@ -1197,6 +1306,39 @@ test "renderChatPayloadJsonAlloc rejects unsupported binary attachments" {
             .kind = .file,
             .path = "assets/files/spec.pdf",
             .mime_type = "application/pdf",
+        },
+    };
+
+    try std.testing.expectError(
+        error.UnsupportedAttachmentType,
+        renderChatPayloadJsonAlloc(
+            std.testing.allocator,
+            "gpt-4.1-mini",
+            "Summarize the attachment.",
+            null,
+            null,
+            null,
+            tmp.dir,
+            attachments[0..],
+        ),
+    );
+}
+
+test "renderChatPayloadJsonAlloc rejects file attachments with image mime types" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("assets/images");
+    try tmp.dir.writeFile(.{
+        .sub_path = "assets/images/red_mug.png",
+        .data = "png",
+    });
+
+    const attachments = [_]registry.Attachment{
+        .{
+            .kind = .file,
+            .path = "assets/images/red_mug.png",
+            .mime_type = "image/png",
         },
     };
 

@@ -228,63 +228,86 @@ fn evaluateToolCalls(
         return failed("missing tool call");
 
     for (expected) |expected_call| {
-        var matched = false;
+        var saw_matching_name = false;
+        var argument_failure: ?[]const u8 = null;
 
         for (actual) |actual_call| {
             if (!std.mem.eql(u8, expected_call.name, actual_call.name)) {
                 continue;
             }
 
-            matched = true;
+            saw_matching_name = true;
 
             if (expected_call.arguments_json) |expected_args| {
-                var parsed = std.json.parseFromSlice(
-                    std.json.Value,
+                const argument_outcome = try evaluateToolCallArguments(
                     allocator,
                     actual_call.arguments_json,
-                    .{},
-                ) catch {
-                    return failed("invalid arguments json");
-                };
-                defer parsed.deinit();
-
-                const actual_args_object = switch (parsed.value) {
-                    .object => |obj| obj,
-                    else => return failed("arguments json is not object"),
-                };
-
-                var expected_parsed = std.json.parseFromSlice(
-                    std.json.Value,
-                    allocator,
                     expected_args,
-                    .{},
-                ) catch {
-                    return failed("invalid expected arguments json");
-                };
-                defer expected_parsed.deinit();
-
-                const expected_object = switch (expected_parsed.value) {
-                    .object => |obj| obj,
-                    else => return failed("expected arguments json is not object"),
-                };
-
-                var iter = expected_object.iterator();
-
-                while (iter.next()) |entry| {
-                    const actual_value = actual_args_object.get(entry.key_ptr.*) orelse {
-                        return failed("missing expected argument field");
-                    };
-                    if (!jsonValuesEqual(entry.value_ptr.*, actual_value)) {
-                        return failed("tool argument value mismatch");
-                    }
+                );
+                if (argument_outcome.passed) {
+                    argument_failure = null;
+                    break;
                 }
+                argument_failure = argument_outcome.failure_reason;
+                continue;
             }
 
+            argument_failure = null;
             break;
         }
 
-        if (!matched) {
+        if (!saw_matching_name) {
             return failed("wrong tool name");
+        }
+        if (argument_failure) |reason| return failed(reason);
+    }
+
+    return passed();
+}
+
+fn evaluateToolCallArguments(
+    allocator: std.mem.Allocator,
+    actual_json: []const u8,
+    expected_json: []const u8,
+) !MatchOutcome {
+    var parsed = std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        actual_json,
+        .{},
+    ) catch {
+        return failed("invalid arguments json");
+    };
+    defer parsed.deinit();
+
+    const actual_args_object = switch (parsed.value) {
+        .object => |obj| obj,
+        else => return failed("arguments json is not object"),
+    };
+
+    var expected_parsed = std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        expected_json,
+        .{},
+    ) catch {
+        return failed("invalid expected arguments json");
+    };
+    defer expected_parsed.deinit();
+
+    const expected_object = switch (expected_parsed.value) {
+        .object => |obj| obj,
+        else => return failed("expected arguments json is not object"),
+    };
+
+    var iter = expected_object.iterator();
+
+    while (iter.next()) |entry| {
+        const actual_value = actual_args_object.get(entry.key_ptr.*) orelse {
+            return failed("missing expected argument field");
+        };
+        if (!jsonValuesEqual(entry.value_ptr.*, actual_value)) {
+            return failed("tool argument value mismatch");
         }
     }
 
@@ -839,6 +862,39 @@ test "evaluate tool_call fails for mismatched argument value" {
 
     try std.testing.expect(!outcome.passed);
     try std.testing.expectEqualStrings("tool argument value mismatch", outcome.failure_reason.?);
+}
+
+test "evaluate tool_call checks later same-name calls for matching args" {
+    const actual_calls = [_]services.ToolCall{
+        .{
+            .name = "search_web",
+            .arguments_json = "{\"query\":\"weather sydney\"}",
+        },
+        .{
+            .name = "search_web",
+            .arguments_json = "{\"query\":\"weather melbourne\",\"extra\":true}",
+        },
+    };
+
+    const expected_calls = [_]registry.ExpectedToolCall{
+        .{
+            .name = "search_web",
+            .arguments_json = "{\"query\":\"weather melbourne\"}",
+        },
+    };
+
+    const outcome = try evaluate(
+        std.testing.allocator,
+        .{
+            .tool_call = .{},
+        },
+        "",
+        null,
+        actual_calls[0..],
+        expected_calls[0..],
+    );
+
+    try std.testing.expect(outcome.passed);
 }
 
 test "evaluate tool_call fails for wrong tool name" {
