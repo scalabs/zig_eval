@@ -350,6 +350,7 @@ fn copyEvalCaseForTask(
         .input = try allocator.dupe(u8, case.input),
         .ideal = if (case.ideal) |ideal| try allocator.dupe(u8, ideal) else null,
         .expected_tool_calls = try copyExpectedToolCalls(allocator, case.expected_tool_calls),
+        .attachments = try copyAttachments(allocator, case.attachments),
     };
 }
 
@@ -371,6 +372,29 @@ fn copyExpectedToolCalls(
     return copied;
 }
 
+fn copyAttachments(
+    allocator: std.mem.Allocator,
+    attachments: ?[]const registry.Attachment,
+) !?[]const registry.Attachment {
+    const source = attachments orelse return null;
+    const copied = try allocator.alloc(registry.Attachment, source.len);
+    for (source, copied) |attachment, *target| {
+        target.* = .{
+            .kind = attachment.kind,
+            .path = try allocator.dupe(u8, attachment.path),
+            .mime_type = if (attachment.mime_type) |mime_type|
+                try allocator.dupe(u8, mime_type)
+            else
+                null,
+            .label = if (attachment.label) |label|
+                try allocator.dupe(u8, label)
+            else
+                null,
+        };
+    }
+    return copied;
+}
+
 fn runOneCase(
     temp_allocator: std.mem.Allocator,
     arena_allocator: std.mem.Allocator,
@@ -385,6 +409,8 @@ fn runOneCase(
     const input = services.ChatCallInput{
         .prompt = case.input,
         .tools = eval_definition.tools,
+        .attachments = case.attachments,
+        .attachment_dir = options.root_dir,
     };
     const started_at = std.time.milliTimestamp();
 
@@ -997,6 +1023,36 @@ test "runEvaluations runs tool_call evals with loaded expected calls" {
     try std.testing.expectEqualStrings("tools.search_web", result.runs[0].eval_id);
 }
 
+test "runEvaluations passes attachments from loaded cases" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("assets/changelogs");
+    try tmp.dir.writeFile(.{
+        .sub_path = "assets/changelogs/release.md",
+        .data = "Retry support and parallel execution shipped.\n",
+    });
+    try tmp.dir.writeFile(.{
+        .sub_path = "cases.jsonl",
+        .data = "{\"id\":\"case-1\",\"input\":\"Summarize\",\"ideal\":\"OK\",\"attachments\":[{\"kind\":\"file\",\"path\":\"assets/changelogs/release.md\",\"mime_type\":\"text/markdown\",\"label\":\"release notes\"}]}\n",
+    });
+
+    const allowlist = [_][]const u8{"product"};
+    const evals = [_]registry.EvalDefinition{evalDefinition("multimodal.release_notes", "cases.jsonl", allowlist[0..])};
+    const configured_services = [_]services.ServiceConfig{serviceConfig("product")};
+
+    var result = try runEvaluations(std.testing.allocator, .{
+        .root_dir = tmp.dir,
+        .services = configured_services[0..],
+        .evals = evals[0..],
+        .service_caller = fakeAttachmentServiceCaller,
+        .matcher_evaluator = fakeMatcherPass,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.runs.len);
+    try std.testing.expect(result.runs[0].passed);
+}
+
 fn evalDefinition(
     id: []const u8,
     dataset_path: []const u8,
@@ -1186,6 +1242,25 @@ fn fakeToolServiceCaller(
         .model = try allocator.dupe(u8, service.default_model),
         .status_code = 200,
         .tool_calls = calls,
+    };
+}
+
+fn fakeAttachmentServiceCaller(
+    allocator: std.mem.Allocator,
+    service: services.ServiceConfig,
+    input: services.ChatCallInput,
+) anyerror!services.ChatCallOutput {
+    const attachments = input.attachments orelse return error.ExpectedAttachments;
+    if (attachments.len != 1) return error.ExpectedAttachments;
+    if (input.attachment_dir == null) return error.ExpectedAttachmentDir;
+    if (!std.mem.eql(u8, attachments[0].path, "assets/changelogs/release.md")) {
+        return error.ExpectedAttachmentPath;
+    }
+
+    return .{
+        .content = try allocator.dupe(u8, "OK"),
+        .model = try allocator.dupe(u8, service.default_model),
+        .status_code = 200,
     };
 }
 
