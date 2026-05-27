@@ -223,15 +223,22 @@ fn evaluateToolCalls(
 ) !MatchOutcome {
     const expected = expected_tool_calls orelse
         return failed("missing expected tool calls");
+    if (expected.len == 0) return failed("missing expected tool calls");
 
     const actual = tool_calls orelse
         return failed("missing tool call");
+    if (actual.len == 0) return failed("missing tool call");
+
+    var used_actual = try allocator.alloc(bool, actual.len);
+    defer allocator.free(used_actual);
+    @memset(used_actual, false);
 
     for (expected) |expected_call| {
         var saw_matching_name = false;
         var argument_failure: ?[]const u8 = null;
 
-        for (actual) |actual_call| {
+        for (actual, 0..) |actual_call, actual_index| {
+            if (used_actual[actual_index]) continue;
             if (!std.mem.eql(u8, expected_call.name, actual_call.name)) {
                 continue;
             }
@@ -246,6 +253,7 @@ fn evaluateToolCalls(
                 );
                 if (argument_outcome.passed) {
                     argument_failure = null;
+                    used_actual[actual_index] = true;
                     break;
                 }
                 argument_failure = argument_outcome.failure_reason;
@@ -253,6 +261,7 @@ fn evaluateToolCalls(
             }
 
             argument_failure = null;
+            used_actual[actual_index] = true;
             break;
         }
 
@@ -895,6 +904,63 @@ test "evaluate tool_call checks later same-name calls for matching args" {
     );
 
     try std.testing.expect(outcome.passed);
+}
+
+test "evaluate tool_call fails for empty actual calls" {
+    const actual_calls = [_]services.ToolCall{};
+    const expected_calls = [_]registry.ExpectedToolCall{
+        .{
+            .name = "search_web",
+            .arguments_json = "{\"query\":\"weather melbourne\"}",
+        },
+    };
+
+    const outcome = try evaluate(
+        std.testing.allocator,
+        .{
+            .tool_call = .{},
+        },
+        "",
+        null,
+        actual_calls[0..],
+        expected_calls[0..],
+    );
+
+    try std.testing.expect(!outcome.passed);
+    try std.testing.expectEqualStrings("missing tool call", outcome.failure_reason.?);
+}
+
+test "evaluate tool_call requires distinct actual calls for duplicate expectations" {
+    const actual_calls = [_]services.ToolCall{
+        .{
+            .name = "search_web",
+            .arguments_json = "{\"query\":\"weather melbourne\"}",
+        },
+    };
+    const expected_calls = [_]registry.ExpectedToolCall{
+        .{
+            .name = "search_web",
+            .arguments_json = "{\"query\":\"weather melbourne\"}",
+        },
+        .{
+            .name = "search_web",
+            .arguments_json = "{\"query\":\"weather melbourne\"}",
+        },
+    };
+
+    const outcome = try evaluate(
+        std.testing.allocator,
+        .{
+            .tool_call = .{},
+        },
+        "",
+        null,
+        actual_calls[0..],
+        expected_calls[0..],
+    );
+
+    try std.testing.expect(!outcome.passed);
+    try std.testing.expectEqualStrings("wrong tool name", outcome.failure_reason.?);
 }
 
 test "evaluate tool_call fails for wrong tool name" {

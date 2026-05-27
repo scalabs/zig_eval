@@ -32,7 +32,7 @@ pub const ServiceCaller = *const fn (
     allocator: std.mem.Allocator,
     service: services.ServiceConfig,
     input: services.ChatCallInput,
-) anyerror!services.ChatCallOutput;
+) anyerror!services.ChatCallResult;
 
 pub const MatcherEvaluator = *const fn (
     allocator: std.mem.Allocator,
@@ -90,6 +90,8 @@ pub const WorkerContext = struct {
     service_limiter: *ServiceLimiter,
     completed_count: *usize,
     progress_mutex: *Mutex,
+    first_error: *?anyerror,
+    error_mutex: *Mutex,
     options: RunnerOptions,
 };
 
@@ -145,6 +147,9 @@ pub fn runEvaluations(
     allocator: std.mem.Allocator,
     options: RunnerOptions,
 ) !RunnerResult {
+    if (options.parallelism == 0) return error.InvalidParallelism;
+    if (options.max_inflight_per_service == 0) return error.InvalidMaxInflightPerService;
+
     const arena = try allocator.create(std.heap.ArenaAllocator);
     arena.* = std.heap.ArenaAllocator.init(allocator);
     errdefer allocator.destroy(arena);
@@ -177,6 +182,8 @@ pub fn runEvaluations(
         var next_index: usize = 0;
         var completed_count: usize = 0;
         var progress_mutex = Mutex{};
+        var first_error: ?anyerror = null;
+        var error_mutex = Mutex{};
         var service_names = try allocator.alloc([]const u8, options.services.len);
         defer allocator.free(service_names);
 
@@ -210,6 +217,8 @@ pub fn runEvaluations(
             .service_limiter = &service_limiter,
             .completed_count = &completed_count,
             .progress_mutex = &progress_mutex,
+            .first_error = &first_error,
+            .error_mutex = &error_mutex,
             .options = options,
         };
 
@@ -221,6 +230,8 @@ pub fn runEvaluations(
         for (threads) |thread| {
             thread.join();
         }
+
+        if (first_error) |err| return err;
     }
 
     std.mem.sort(RunResult, runs.items, {}, compareRunResults);
@@ -232,8 +243,10 @@ pub fn runEvaluations(
     };
 }
 
-fn workerLoop(context: *WorkerContext) !void {
+fn workerLoop(context: *WorkerContext) void {
     while (true) {
+        if (hasWorkerError(context)) return;
+
         context.index_mutex.lock();
         const index = context.next_index.*;
         if (index >= context.tasks.len) {
@@ -249,7 +262,7 @@ fn workerLoop(context: *WorkerContext) !void {
         context.service_limiter.acquire(task.service.name);
         defer context.service_limiter.release(task.service.name);
 
-        try runOneCase(
+        runOneCase(
             context.allocator,
             context.arena_allocator,
             context.runs,
@@ -259,22 +272,41 @@ fn workerLoop(context: *WorkerContext) !void {
             task.service,
             task.case,
             task.run_index,
-        );
+        ) catch |err| {
+            recordWorkerError(context, err);
+            return;
+        };
 
         context.progress_mutex.lock();
+        defer context.progress_mutex.unlock();
 
         context.completed_count.* += 1;
 
         if (context.options.show_progress) {
             if (context.options.progress_writer) |writer| {
-                try writer.print(
+                writer.print(
                     "completed {d}/{d} eval runs\n",
                     .{ context.completed_count.*, context.tasks.len },
-                );
+                ) catch |err| {
+                    recordWorkerError(context, err);
+                    return;
+                };
             }
         }
+    }
+}
 
-        context.progress_mutex.unlock();
+fn hasWorkerError(context: *WorkerContext) bool {
+    context.error_mutex.lock();
+    defer context.error_mutex.unlock();
+    return context.first_error.* != null;
+}
+
+fn recordWorkerError(context: *WorkerContext, err: anyerror) void {
+    context.error_mutex.lock();
+    defer context.error_mutex.unlock();
+    if (context.first_error.* == null) {
+        context.first_error.* = err;
     }
 }
 
@@ -414,7 +446,7 @@ fn runOneCase(
     };
     const started_at = std.time.milliTimestamp();
 
-    var output = options.service_caller(temp_allocator, service, input) catch |err| {
+    var call_result = options.service_caller(temp_allocator, service, input) catch |err| {
         runs_mutex.lock();
         defer runs_mutex.unlock();
 
@@ -433,7 +465,32 @@ fn runOneCase(
         });
         return;
     };
-    defer output.deinit(temp_allocator);
+    defer call_result.deinit(temp_allocator);
+
+    const output = switch (call_result) {
+        .success => |*success| success,
+        .failure => |*failure| {
+            runs_mutex.lock();
+            defer runs_mutex.unlock();
+
+            try appendRunResult(temp_allocator, arena_allocator, runs, .{
+                .group = eval_definition.group,
+                .eval_id = eval_definition.id,
+                .service_name = service.name,
+                .model = failure.model,
+                .run_index = run_index,
+                .case_id = case.id,
+                .output = "",
+                .passed = false,
+                .score = 0.0,
+                .failure_reason = failure.reason,
+                .attempt_count = failure.attempt_count,
+                .retried = failure.retried,
+                .latency_ms = elapsedMillis(started_at),
+            });
+            return;
+        },
+    };
 
     const outcome = evaluateRunMatcher(
         temp_allocator,
@@ -514,11 +571,24 @@ fn evaluateModelGradeMatcher(
     });
     defer allocator.free(prompt);
 
-    var judge_output = try options.service_caller(allocator, judge_service, .{
+    var judge_result = try options.service_caller(allocator, judge_service, .{
         .prompt = prompt,
         .model_override = config.judge_model,
     });
-    defer judge_output.deinit(allocator);
+    defer judge_result.deinit(allocator);
+
+    const judge_output = switch (judge_result) {
+        .success => |*success| success,
+        .failure => |*failure| {
+            const owned_reason = try allocator.dupe(u8, failure.reason);
+            return .{
+                .passed = false,
+                .score = 0.0,
+                .failure_reason = owned_reason,
+                .owned_failure_reason = owned_reason,
+            };
+        },
+    };
 
     return parseJudgeOutcome(allocator, judge_output.content, config.pass_score);
 }
@@ -637,8 +707,8 @@ fn defaultServiceCaller(
     allocator: std.mem.Allocator,
     service: services.ServiceConfig,
     input: services.ChatCallInput,
-) anyerror!services.ChatCallOutput {
-    return services.callChatCompletion(allocator, service, input);
+) anyerror!services.ChatCallResult {
+    return services.callChatCompletionResult(allocator, service, input);
 }
 
 test "RunResult represents one evaluated case" {
@@ -957,6 +1027,40 @@ test "runEvaluations returns dataset load failure" {
     }));
 }
 
+test "runEvaluations rejects zero parallelism" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const evals = [_]registry.EvalDefinition{evalDefinition("eval.invalid", "cases.jsonl", null)};
+    const configured_services = [_]services.ServiceConfig{serviceConfig("svc")};
+
+    try std.testing.expectError(error.InvalidParallelism, runEvaluations(std.testing.allocator, .{
+        .root_dir = tmp.dir,
+        .services = configured_services[0..],
+        .evals = evals[0..],
+        .parallelism = 0,
+        .service_caller = fakeServiceCaller,
+        .matcher_evaluator = fakeMatcherPass,
+    }));
+}
+
+test "runEvaluations rejects zero max inflight per service" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const evals = [_]registry.EvalDefinition{evalDefinition("eval.invalid", "cases.jsonl", null)};
+    const configured_services = [_]services.ServiceConfig{serviceConfig("svc")};
+
+    try std.testing.expectError(error.InvalidMaxInflightPerService, runEvaluations(std.testing.allocator, .{
+        .root_dir = tmp.dir,
+        .services = configured_services[0..],
+        .evals = evals[0..],
+        .max_inflight_per_service = 0,
+        .service_caller = fakeServiceCaller,
+        .matcher_evaluator = fakeMatcherPass,
+    }));
+}
+
 test "RunResult stores retry metadata" {
     const result = RunResult{
         .group = "retry_group",
@@ -976,6 +1080,54 @@ test "RunResult stores retry metadata" {
 
     try std.testing.expectEqual(@as(u32, 3), result.attempt_count);
     try std.testing.expect(result.retried);
+}
+
+test "runEvaluations records detailed service failure retry metadata" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeDataset(tmp.dir, "cases.jsonl", "case-1", "prompt");
+
+    const evals = [_]registry.EvalDefinition{evalDefinition("eval.retry_failure", "cases.jsonl", null)};
+    const configured_services = [_]services.ServiceConfig{serviceConfig("svc")};
+
+    var result = try runEvaluations(std.testing.allocator, .{
+        .root_dir = tmp.dir,
+        .services = configured_services[0..],
+        .evals = evals[0..],
+        .service_caller = fakeDetailedServiceFailure,
+        .matcher_evaluator = fakeMatcherPass,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.runs.len);
+    try std.testing.expect(!result.runs[0].passed);
+    try std.testing.expectEqualStrings("upstream unavailable", result.runs[0].failure_reason.?);
+    try std.testing.expectEqual(@as(u32, 3), result.runs[0].attempt_count);
+    try std.testing.expect(result.runs[0].retried);
+}
+
+test "runEvaluations propagates parallel worker progress writer errors" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeDataset(tmp.dir, "cases.jsonl", "case-1", "prompt");
+
+    const evals = [_]registry.EvalDefinition{evalDefinition("eval.worker_error", "cases.jsonl", null)};
+    const configured_services = [_]services.ServiceConfig{serviceConfig("svc")};
+    var failing_writer = std.Io.Writer{
+        .vtable = &failing_writer_vtable,
+        .buffer = &.{},
+    };
+
+    try std.testing.expectError(error.WriteFailed, runEvaluations(std.testing.allocator, .{
+        .root_dir = tmp.dir,
+        .services = configured_services[0..],
+        .evals = evals[0..],
+        .parallelism = 2,
+        .show_progress = true,
+        .progress_writer = &failing_writer,
+        .service_caller = fakeServiceCaller,
+        .matcher_evaluator = fakeMatcherPass,
+    }));
 }
 
 test "runEvaluations runs tool_call evals with loaded expected calls" {
@@ -1107,31 +1259,60 @@ fn fakeServiceCaller(
     allocator: std.mem.Allocator,
     service: services.ServiceConfig,
     input: services.ChatCallInput,
-) anyerror!services.ChatCallOutput {
+) anyerror!services.ChatCallResult {
     _ = input;
-    return .{
-        .content = try allocator.dupe(u8, "OK"),
-        .model = try allocator.dupe(u8, service.default_model),
-        .status_code = 200,
-    };
+    return fakeSuccess(allocator, service.default_model, "OK");
 }
 
 fn fakeServiceFailure(
     allocator: std.mem.Allocator,
     service: services.ServiceConfig,
     input: services.ChatCallInput,
-) anyerror!services.ChatCallOutput {
+) anyerror!services.ChatCallResult {
     _ = allocator;
     _ = service;
     _ = input;
     return error.FakeServiceFailure;
 }
 
+fn fakeDetailedServiceFailure(
+    allocator: std.mem.Allocator,
+    service: services.ServiceConfig,
+    input: services.ChatCallInput,
+) anyerror!services.ChatCallResult {
+    _ = input;
+    return .{
+        .failure = .{
+            .kind = .upstream_http_error,
+            .reason = try allocator.dupe(u8, "upstream unavailable"),
+            .model = try allocator.dupe(u8, service.default_model),
+            .status_code = 503,
+            .attempt_count = 3,
+            .retried = true,
+        },
+    };
+}
+
+const failing_writer_vtable = std.Io.Writer.VTable{
+    .drain = failingWriterDrain,
+};
+
+fn failingWriterDrain(
+    writer: *std.Io.Writer,
+    data: []const []const u8,
+    splat: usize,
+) std.Io.Writer.Error!usize {
+    _ = writer;
+    _ = data;
+    _ = splat;
+    return error.WriteFailed;
+}
+
 fn fakeModelGradeServiceCaller(
     allocator: std.mem.Allocator,
     service: services.ServiceConfig,
     input: services.ChatCallInput,
-) anyerror!services.ChatCallOutput {
+) anyerror!services.ChatCallResult {
     if (std.mem.eql(u8, service.name, "judge")) {
         if (input.model_override == null or !std.mem.eql(u8, input.model_override.?, "judge-model")) {
             return error.ExpectedJudgeModelOverride;
@@ -1139,94 +1320,62 @@ fn fakeModelGradeServiceCaller(
         if (std.mem.indexOf(u8, input.prompt, "candidate answer") == null) {
             return error.ExpectedCandidateOutputInJudgePrompt;
         }
-        return .{
-            .content = try allocator.dupe(u8, "{\"score\":0.9,\"passed\":true,\"reason\":\"Correct.\"}"),
-            .model = try allocator.dupe(u8, "judge-model"),
-            .status_code = 200,
-        };
+        return fakeSuccess(allocator, "judge-model", "{\"score\":0.9,\"passed\":true,\"reason\":\"Correct.\"}");
     }
 
-    return .{
-        .content = try allocator.dupe(u8, "candidate answer"),
-        .model = try allocator.dupe(u8, service.default_model),
-        .status_code = 200,
-    };
+    return fakeSuccess(allocator, service.default_model, "candidate answer");
 }
 
 fn fakeInvalidJudgeServiceCaller(
     allocator: std.mem.Allocator,
     service: services.ServiceConfig,
     input: services.ChatCallInput,
-) anyerror!services.ChatCallOutput {
+) anyerror!services.ChatCallResult {
     _ = input;
     if (std.mem.eql(u8, service.name, "judge")) {
-        return .{
-            .content = try allocator.dupe(u8, "not json"),
-            .model = try allocator.dupe(u8, service.default_model),
-            .status_code = 200,
-        };
+        return fakeSuccess(allocator, service.default_model, "not json");
     }
 
-    return .{
-        .content = try allocator.dupe(u8, "candidate answer"),
-        .model = try allocator.dupe(u8, service.default_model),
-        .status_code = 200,
-    };
+    return fakeSuccess(allocator, service.default_model, "candidate answer");
 }
 
 fn fakeOverrideJudgeServiceCaller(
     allocator: std.mem.Allocator,
     service: services.ServiceConfig,
     input: services.ChatCallInput,
-) anyerror!services.ChatCallOutput {
+) anyerror!services.ChatCallResult {
     if (std.mem.eql(u8, service.name, "override-judge")) {
         if (std.mem.indexOf(u8, input.prompt, "candidate answer") == null) {
             return error.ExpectedCandidateOutputInJudgePrompt;
         }
-        return .{
-            .content = try allocator.dupe(u8, "{\"score\":0.95,\"passed\":true,\"reason\":\"Strong answer.\"}"),
-            .model = try allocator.dupe(u8, service.default_model),
-            .status_code = 200,
-        };
+        return fakeSuccess(allocator, service.default_model, "{\"score\":0.95,\"passed\":true,\"reason\":\"Strong answer.\"}");
     }
 
     if (std.mem.eql(u8, service.name, "default-judge")) {
         return error.DefaultJudgeShouldNotBeCalled;
     }
 
-    return .{
-        .content = try allocator.dupe(u8, "candidate answer"),
-        .model = try allocator.dupe(u8, service.default_model),
-        .status_code = 200,
-    };
+    return fakeSuccess(allocator, service.default_model, "candidate answer");
 }
 
 fn fakeFailingJudgeServiceCaller(
     allocator: std.mem.Allocator,
     service: services.ServiceConfig,
     input: services.ChatCallInput,
-) anyerror!services.ChatCallOutput {
+) anyerror!services.ChatCallResult {
     _ = input;
     if (std.mem.eql(u8, service.name, "judge")) {
-        return .{
-            .content = try allocator.dupe(u8, "{\"score\":0.4,\"passed\":false,\"reason\":\"Missing key facts.\"}"),
-            .model = try allocator.dupe(u8, service.default_model),
-            .status_code = 200,
-        };
+        return fakeSuccess(allocator, service.default_model, "{\"score\":0.4,\"passed\":false,\"reason\":\"Missing key facts.\"}");
     }
 
-    return .{
-        .content = try allocator.dupe(u8, "candidate answer"),
-        .model = try allocator.dupe(u8, service.default_model),
-        .status_code = 200,
-    };
+    return fakeSuccess(allocator, service.default_model, "candidate answer");
 }
 
 fn fakeToolServiceCaller(
     allocator: std.mem.Allocator,
     service: services.ServiceConfig,
     input: services.ChatCallInput,
-) anyerror!services.ChatCallOutput {
+) anyerror!services.ChatCallResult {
     if (input.tools == null or input.tools.?.len != 1) {
         return error.ExpectedToolSchemas;
     }
@@ -1238,10 +1387,12 @@ fn fakeToolServiceCaller(
     };
 
     return .{
-        .content = try allocator.dupe(u8, ""),
-        .model = try allocator.dupe(u8, service.default_model),
-        .status_code = 200,
-        .tool_calls = calls,
+        .success = .{
+            .content = try allocator.dupe(u8, ""),
+            .model = try allocator.dupe(u8, service.default_model),
+            .status_code = 200,
+            .tool_calls = calls,
+        },
     };
 }
 
@@ -1249,7 +1400,7 @@ fn fakeAttachmentServiceCaller(
     allocator: std.mem.Allocator,
     service: services.ServiceConfig,
     input: services.ChatCallInput,
-) anyerror!services.ChatCallOutput {
+) anyerror!services.ChatCallResult {
     const attachments = input.attachments orelse return error.ExpectedAttachments;
     if (attachments.len != 1) return error.ExpectedAttachments;
     if (input.attachment_dir == null) return error.ExpectedAttachmentDir;
@@ -1257,10 +1408,20 @@ fn fakeAttachmentServiceCaller(
         return error.ExpectedAttachmentPath;
     }
 
+    return fakeSuccess(allocator, service.default_model, "OK");
+}
+
+fn fakeSuccess(
+    allocator: std.mem.Allocator,
+    model: []const u8,
+    content: []const u8,
+) !services.ChatCallResult {
     return .{
-        .content = try allocator.dupe(u8, "OK"),
-        .model = try allocator.dupe(u8, service.default_model),
-        .status_code = 200,
+        .success = .{
+            .content = try allocator.dupe(u8, content),
+            .model = try allocator.dupe(u8, model),
+            .status_code = 200,
+        },
     };
 }
 

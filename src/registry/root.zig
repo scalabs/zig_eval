@@ -164,6 +164,8 @@ pub fn loadEvalCases(
     dir: std.fs.Dir,
     path: []const u8,
 ) !LoadedEvalCases {
+    try validateDatasetRelativePath(path);
+
     const arena = try allocator.create(std.heap.ArenaAllocator);
     arena.* = std.heap.ArenaAllocator.init(allocator);
     errdefer allocator.destroy(arena);
@@ -345,6 +347,7 @@ fn parseOptionalExpectedToolCalls(
         .array => |array| array,
         else => return error.InvalidEvalCase,
     };
+    if (array.items.len == 0) return error.InvalidEvalCase;
 
     var items = std.ArrayList(ExpectedToolCall){};
     defer items.deinit(allocator);
@@ -824,6 +827,26 @@ test "loadEvalCases loads JSONL datasets and ignores blank lines" {
     try std.testing.expectEqualStrings("case-2", loaded.items[1].id);
 }
 
+test "loadEvalCases rejects unsafe dataset paths directly" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try std.testing.expectError(
+        error.InvalidDatasetPath,
+        loadEvalCases(std.testing.allocator, tmp.dir, "../secret.jsonl"),
+    );
+}
+
+test "loadEvalCases rejects absolute dataset paths directly" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try std.testing.expectError(
+        error.InvalidDatasetPath,
+        loadEvalCases(std.testing.allocator, tmp.dir, "/tmp/secret.jsonl"),
+    );
+}
+
 test "loadEvalCases rejects malformed JSONL lines" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1069,6 +1092,32 @@ test "parseEvalCase supports expected tool calls" {
 
     try std.testing.expectEqual(@as(usize, 1), calls.len);
     try std.testing.expectEqualStrings("search_web", calls[0].name);
+}
+
+test "parseEvalCase rejects empty expected tool calls" {
+    const json =
+        \\{
+        \\  "id": "case-1",
+        \\  "input": "Search weather",
+        \\  "expected_tool_calls": []
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parsed_json = try std.json.parseFromSlice(
+        std.json.Value,
+        arena.allocator(),
+        json,
+        .{},
+    );
+    defer parsed_json.deinit();
+
+    try std.testing.expectError(
+        error.InvalidEvalCase,
+        parseEvalCase(arena.allocator(), parsed_json.value),
+    );
 }
 
 test "parseEvalCase supports file attachments" {

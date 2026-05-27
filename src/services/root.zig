@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const registry = @import("../registry/root.zig");
 
 const max_file_bytes = 1024 * 1024;
+const max_response_bytes = 8 * 1024 * 1024;
 
 pub const RetryConfig = struct {
     max_attempts: u32 = 1,
@@ -47,6 +48,31 @@ pub const ToolCall = struct {
     arguments_json: []const u8,
 };
 
+pub const ChatCallFailureKind = enum {
+    fetch_error,
+    upstream_http_error,
+    invalid_upstream_json,
+    malformed_success_payload,
+    response_too_large,
+    invalid_request,
+    retry_exhausted,
+};
+
+pub const ChatCallFailure = struct {
+    kind: ChatCallFailureKind,
+    reason: []u8,
+    model: []u8,
+    status_code: ?u16 = null,
+    attempt_count: u32 = 1,
+    retried: bool = false,
+
+    pub fn deinit(self: *ChatCallFailure, allocator: std.mem.Allocator) void {
+        allocator.free(self.reason);
+        allocator.free(self.model);
+        self.* = undefined;
+    }
+};
+
 /// `callChatCompletion` returns owned buffers; `deinit` releases them.
 pub const ChatCallOutput = struct {
     content: []u8,
@@ -61,6 +87,19 @@ pub const ChatCallOutput = struct {
         allocator.free(self.model);
         if (self.tool_calls) |calls| {
             freeToolCalls(allocator, calls);
+        }
+        self.* = undefined;
+    }
+};
+
+pub const ChatCallResult = union(enum) {
+    success: ChatCallOutput,
+    failure: ChatCallFailure,
+
+    pub fn deinit(self: *ChatCallResult, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .success => |*output| output.deinit(allocator),
+            .failure => |*failure| failure.deinit(allocator),
         }
         self.* = undefined;
     }
@@ -92,8 +131,14 @@ pub fn loadServices(
     var items = std.ArrayList(ServiceConfig){};
     defer items.deinit(allocator);
 
+    var seen_names = std.StringHashMap(void).init(allocator);
+    defer seen_names.deinit();
+
     for (values) |value| {
-        try items.append(allocator, try parseServiceConfig(arena.allocator(), value));
+        const service = try parseServiceConfig(arena.allocator(), value);
+        const gop = try seen_names.getOrPut(service.name);
+        if (gop.found_existing) return error.DuplicateServiceName;
+        try items.append(allocator, service);
     }
 
     return .{
@@ -127,14 +172,33 @@ pub fn callChatCompletion(
     service: ServiceConfig,
     input: ChatCallInput,
 ) !ChatCallOutput {
+    var result = try callChatCompletionResult(allocator, service, input);
+    switch (result) {
+        .success => |output| return output,
+        .failure => |*failure| {
+            defer failure.deinit(allocator);
+            return failureKindToError(failure.kind);
+        },
+    }
+}
+
+pub fn callChatCompletionResult(
+    allocator: std.mem.Allocator,
+    service: ServiceConfig,
+    input: ChatCallInput,
+) !ChatCallResult {
     const model_name = selectModelName(service, input);
     const system_prompt = selectSystemPrompt(service, input);
 
-    const endpoint = try normalizeChatCompletionsUrl(allocator, service.base_url);
+    const endpoint = normalizeChatCompletionsUrl(allocator, service.base_url) catch |err| {
+        return try failureResultFromError(allocator, err, .invalid_request, null, 1, false, model_name);
+    };
     defer allocator.free(endpoint);
-    const uri = try std.Uri.parse(endpoint);
+    const uri = std.Uri.parse(endpoint) catch |err| {
+        return try failureResultFromError(allocator, err, .invalid_request, null, 1, false, model_name);
+    };
 
-    const payload = try renderChatPayloadJsonAlloc(
+    const payload = renderChatPayloadJsonAlloc(
         allocator,
         model_name,
         input.prompt,
@@ -143,14 +207,18 @@ pub fn callChatCompletion(
         input.tools,
         input.attachment_dir,
         input.attachments,
-    );
+    ) catch |err| {
+        return try failureResultFromError(allocator, err, .invalid_request, null, 1, false, model_name);
+    };
     defer allocator.free(payload);
 
     var headers = std.ArrayList(std.http.Header){};
     defer headers.deinit(allocator);
     try headers.append(allocator, .{ .name = "content-type", .value = "application/json" });
 
-    const api_key = try readApiKeyFromEnv(allocator, service.api_key_env);
+    const api_key = readApiKeyFromEnv(allocator, service.api_key_env) catch |err| {
+        return try failureResultFromError(allocator, err, .invalid_request, null, 1, false, model_name);
+    };
     defer if (api_key) |key| allocator.free(key);
 
     var auth_header_value: ?[]u8 = null;
@@ -180,7 +248,15 @@ pub fn callChatCompletion(
             service.timeout_ms,
         ) catch |err| {
             if (attempt >= max_attempts) {
-                return err;
+                return try failureResultFromError(
+                    allocator,
+                    err,
+                    failureKindFromError(err),
+                    null,
+                    attempt,
+                    attempt > 1,
+                    model_name,
+                );
             }
 
             retryDelay(service.retry.backoff_ms, attempt);
@@ -192,20 +268,44 @@ pub fn callChatCompletion(
             continue;
         }
 
-        var parsed = try parseChatCompletionResponse(
+        var parsed = parseChatCompletionResponse(
             allocator,
             fetch_result.status,
             response_writer.written(),
             model_name,
-        );
+        ) catch |err| {
+            const reason = if (err == error.UpstreamHttpError)
+                try upstreamFailureReason(allocator, response_writer.written(), err)
+            else
+                try allocator.dupe(u8, @errorName(err));
+            defer allocator.free(reason);
+
+            return try failureResult(
+                allocator,
+                failureKindFromError(err),
+                reason,
+                @intFromEnum(fetch_result.status),
+                attempt,
+                attempt > 1,
+                model_name,
+            );
+        };
 
         parsed.attempt_count = attempt;
         parsed.retried = attempt > 1;
 
-        return parsed;
+        return .{ .success = parsed };
     }
 
-    return error.RetryExhausted;
+    return try failureResultFromError(
+        allocator,
+        error.RetryExhausted,
+        .retry_exhausted,
+        null,
+        max_attempts,
+        max_attempts > 1,
+        model_name,
+    );
 }
 
 fn fetchChatCompletionWithTimeout(
@@ -246,12 +346,103 @@ fn fetchChatCompletionWithTimeout(
     var transfer_buffer: [64]u8 = undefined;
     var decompress: std.http.Decompress = undefined;
     const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
-    _ = reader.streamRemaining(response_writer) catch |err| switch (err) {
+    streamResponseWithLimit(reader, response_writer, max_response_bytes) catch |err| switch (err) {
         error.ReadFailed => return response.bodyErr().?,
         else => |e| return e,
     };
 
     return .{ .status = response.head.status };
+}
+
+fn streamResponseWithLimit(
+    reader: *std.Io.Reader,
+    response_writer: *std.Io.Writer,
+    max_bytes: usize,
+) !void {
+    var bytes_read: usize = 0;
+    while (true) {
+        const remaining = max_bytes + 1 - bytes_read;
+        const n = reader.stream(response_writer, .limited(remaining)) catch |err| switch (err) {
+            else => |e| return e,
+        };
+        bytes_read += n;
+        if (bytes_read > max_bytes) return error.ResponseTooLarge;
+        if (n == 0) break;
+    }
+}
+
+fn failureKindToError(kind: ChatCallFailureKind) anyerror {
+    return switch (kind) {
+        .fetch_error => error.FetchFailed,
+        .upstream_http_error => error.UpstreamHttpError,
+        .invalid_upstream_json => error.InvalidUpstreamJson,
+        .malformed_success_payload => error.MalformedSuccessPayload,
+        .response_too_large => error.ResponseTooLarge,
+        .invalid_request => error.InvalidChatRequest,
+        .retry_exhausted => error.RetryExhausted,
+    };
+}
+
+fn failureKindFromError(err: anyerror) ChatCallFailureKind {
+    return switch (err) {
+        error.UpstreamHttpError => .upstream_http_error,
+        error.InvalidUpstreamJson => .invalid_upstream_json,
+        error.MalformedSuccessPayload => .malformed_success_payload,
+        error.ResponseTooLarge, error.StreamTooLong => .response_too_large,
+        error.RetryExhausted => .retry_exhausted,
+        error.InvalidAttachmentPath,
+        error.InvalidAttachmentMimeType,
+        error.UnsupportedAttachmentType,
+        error.MissingAttachmentRoot,
+        error.InvalidAttachmentText,
+        error.FileNotFound,
+        => .invalid_request,
+        else => .fetch_error,
+    };
+}
+
+fn failureResultFromError(
+    allocator: std.mem.Allocator,
+    err: anyerror,
+    kind: ChatCallFailureKind,
+    status_code: ?u16,
+    attempt_count: u32,
+    retried: bool,
+    model: []const u8,
+) !ChatCallResult {
+    return failureResult(
+        allocator,
+        kind,
+        @errorName(err),
+        status_code,
+        attempt_count,
+        retried,
+        model,
+    );
+}
+
+fn failureResult(
+    allocator: std.mem.Allocator,
+    kind: ChatCallFailureKind,
+    reason: []const u8,
+    status_code: ?u16,
+    attempt_count: u32,
+    retried: bool,
+    model: []const u8,
+) !ChatCallResult {
+    const owned_reason = try allocator.dupe(u8, reason);
+    errdefer allocator.free(owned_reason);
+    const owned_model = try allocator.dupe(u8, model);
+    return .{
+        .failure = .{
+            .kind = kind,
+            .reason = owned_reason,
+            .model = owned_model,
+            .status_code = status_code,
+            .attempt_count = attempt_count,
+            .retried = retried,
+        },
+    };
 }
 
 fn applyConnectionTimeout(connection: *std.http.Client.Connection, timeout_ms: u32) !void {
@@ -522,12 +713,9 @@ fn writeUserMessageObject(
     try writeTextContentBlock(json_writer, text_content);
 
     for (attachment_list) |attachment| {
-        const mime_type = attachmentMimeType(attachment) orelse return error.UnsupportedAttachmentType;
+        const mime_type = try validatedAttachmentMimeType(attachment);
         if (attachment.kind == .image) {
-            if (!isImageMimeType(mime_type)) return error.UnsupportedAttachmentType;
             try writeImageContentBlock(json_writer, allocator, dir, attachment, mime_type);
-        } else if (isImageMimeType(mime_type) or !isTextMimeType(mime_type)) {
-            return error.UnsupportedAttachmentType;
         }
     }
 
@@ -547,12 +735,10 @@ fn buildTextContentWithAttachments(
     try out.writer.writeAll(prompt);
 
     for (attachments) |attachment| {
-        const mime_type = attachmentMimeType(attachment) orelse return error.UnsupportedAttachmentType;
+        const mime_type = try validatedAttachmentMimeType(attachment);
         if (attachment.kind == .image) {
-            if (!isImageMimeType(mime_type)) return error.UnsupportedAttachmentType;
             continue;
         }
-        if (isImageMimeType(mime_type) or !isTextMimeType(mime_type)) return error.UnsupportedAttachmentType;
 
         const raw = try dir.readFileAlloc(allocator, attachment.path, registry.max_attachment_bytes);
         defer allocator.free(raw);
@@ -619,6 +805,32 @@ fn imageDataUrl(
 
 fn attachmentMimeType(attachment: registry.Attachment) ?[]const u8 {
     return attachment.mime_type orelse registry.inferAttachmentMimeType(attachment.path);
+}
+
+fn validatedAttachmentMimeType(attachment: registry.Attachment) ![]const u8 {
+    if (!isSafeRelativePath(attachment.path)) return error.InvalidAttachmentPath;
+    const mime_type = attachmentMimeType(attachment) orelse return error.UnsupportedAttachmentType;
+    const image_mime = isImageMimeType(mime_type);
+    switch (attachment.kind) {
+        .image => if (!image_mime) return error.InvalidAttachmentMimeType,
+        .file => {
+            if (image_mime) return error.InvalidAttachmentMimeType;
+            if (!isTextMimeType(mime_type)) return error.UnsupportedAttachmentType;
+        },
+    }
+    return mime_type;
+}
+
+fn isSafeRelativePath(path: []const u8) bool {
+    if (std.fs.path.isAbsolute(path)) return false;
+    var parts = std.mem.splitAny(u8, path, "/\\");
+    while (parts.next()) |part| {
+        if (part.len == 0) return false;
+        if (std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) {
+            return false;
+        }
+    }
+    return true;
 }
 
 fn isImageMimeType(mime_type: []const u8) bool {
@@ -702,8 +914,6 @@ fn parseChatCompletionResponse(
     fallback_model: []const u8,
 ) !ChatCallOutput {
     if (status != .ok) {
-        const detail = extractUpstreamErrorMessage(allocator, raw) catch null;
-        if (detail) |message| allocator.free(message);
         return error.UpstreamHttpError;
     }
 
@@ -766,6 +976,15 @@ fn parseChatCompletionResponse(
         .status_code = @intFromEnum(status),
         .tool_calls = tool_calls,
     };
+}
+
+fn upstreamFailureReason(
+    allocator: std.mem.Allocator,
+    raw: []const u8,
+    fallback: anyerror,
+) ![]u8 {
+    return try extractUpstreamErrorMessage(allocator, raw) orelse
+        try allocator.dupe(u8, @errorName(fallback));
 }
 
 fn extractUpstreamErrorMessage(
@@ -931,6 +1150,17 @@ test "setSocketTimeout applies send and receive timeout options" {
     try setSocketTimeout(socket, std.posix.SO.SNDTIMEO, 25);
 }
 
+test "streamResponseWithLimit rejects oversized responses" {
+    var reader = std.Io.Reader.fixed("abcdef");
+    var out = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer out.deinit();
+
+    try std.testing.expectError(
+        error.ResponseTooLarge,
+        streamResponseWithLimit(&reader, &out.writer, 3),
+    );
+}
+
 test "loadServices loads valid services.json" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -995,6 +1225,37 @@ test "loadServices allows unauthenticated product endpoints" {
     try std.testing.expectEqual(@as(usize, 1), loaded.items.len);
     try std.testing.expectEqualStrings("internal-product", loaded.items[0].name);
     try std.testing.expect(loaded.items[0].api_key_env == null);
+}
+
+test "loadServices rejects duplicate service names" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("registry");
+    try tmp.dir.writeFile(.{
+        .sub_path = "registry/services.json",
+        .data =
+        \\[
+        \\  {
+        \\    "name": "product-api",
+        \\    "base_url": "http://127.0.0.1:9000/v1",
+        \\    "default_model": "model-a",
+        \\    "timeout_ms": 1000
+        \\  },
+        \\  {
+        \\    "name": "product-api",
+        \\    "base_url": "http://127.0.0.1:9001/v1",
+        \\    "default_model": "model-b",
+        \\    "timeout_ms": 1000
+        \\  }
+        \\]
+        ,
+    });
+
+    try std.testing.expectError(
+        error.DuplicateServiceName,
+        loadServices(std.testing.allocator, tmp.dir, "registry/services.json"),
+    );
 }
 
 test "loadServices rejects missing required fields" {
@@ -1324,6 +1585,33 @@ test "renderChatPayloadJsonAlloc rejects unsupported binary attachments" {
     );
 }
 
+test "renderChatPayloadJsonAlloc rejects unsafe manual attachment paths" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const attachments = [_]registry.Attachment{
+        .{
+            .kind = .file,
+            .path = "../secret.md",
+            .mime_type = "text/markdown",
+        },
+    };
+
+    try std.testing.expectError(
+        error.InvalidAttachmentPath,
+        renderChatPayloadJsonAlloc(
+            std.testing.allocator,
+            "gpt-4.1-mini",
+            "Summarize the attachment.",
+            null,
+            null,
+            null,
+            tmp.dir,
+            attachments[0..],
+        ),
+    );
+}
+
 test "renderChatPayloadJsonAlloc rejects file attachments with image mime types" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1343,7 +1631,7 @@ test "renderChatPayloadJsonAlloc rejects file attachments with image mime types"
     };
 
     try std.testing.expectError(
-        error.UnsupportedAttachmentType,
+        error.InvalidAttachmentMimeType,
         renderChatPayloadJsonAlloc(
             std.testing.allocator,
             "gpt-4.1-mini",

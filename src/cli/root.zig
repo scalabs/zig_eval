@@ -180,7 +180,14 @@ fn evaluateMatcher(
     tool_calls: ?[]const services.ToolCall,
     expected_tool_calls: ?[]const registry.ExpectedToolCall,
 ) anyerror!runner.MatcherOutcome {
-    const outcome = try matchers.evaluate(allocator, matcher, output, ideal,tool_calls,expected_tool_calls);
+    const outcome = try matchers.evaluate(
+        allocator,
+        matcher,
+        output,
+        ideal,
+        tool_calls,
+        expected_tool_calls,
+    );
     return .{
         .passed = outcome.passed,
         .score = outcome.score,
@@ -192,8 +199,8 @@ fn defaultServiceCaller(
     allocator: std.mem.Allocator,
     service: services.ServiceConfig,
     input: services.ChatCallInput,
-) anyerror!services.ChatCallOutput {
-    return services.callChatCompletion(allocator, service, input);
+) anyerror!services.ChatCallResult {
+    return services.callChatCompletionResult(allocator, service, input);
 }
 
 fn parseCommand(value: []const u8) !Command {
@@ -356,7 +363,7 @@ fn fakeServiceCaller(
     allocator: std.mem.Allocator,
     service: services.ServiceConfig,
     input: services.ChatCallInput,
-) anyerror!services.ChatCallOutput {
+) anyerror!services.ChatCallResult {
     const content = if (std.mem.eql(u8, service.name, "judge"))
         "{\"score\":0.9,\"passed\":true,\"reason\":\"Meets rubric.\"}"
     else if (std.mem.indexOf(u8, input.prompt, "READY") != null)
@@ -367,8 +374,10 @@ fn fakeServiceCaller(
         "OK";
 
     return .{
-        .content = try allocator.dupe(u8, content),
-        .model = try allocator.dupe(u8, service.default_model),
-        .status_code = 200,
+        .success = .{
+            .content = try allocator.dupe(u8, content),
+            .model = try allocator.dupe(u8, service.default_model),
+            .status_code = 200,
+        },
     };
 }

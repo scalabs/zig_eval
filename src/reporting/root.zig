@@ -286,7 +286,7 @@ fn formatStatsLine(
 ) !void {
     try writer.splatByteAll(' ', indent);
     try writer.print(
-        "{s}: total={d} passed={d} failed={d} pass_rate={d:.2}% ci95=[{d:.2}%, {d:.2}%] mean_ms={d:.2} p50_ms={d} p95_ms={d}\n",
+        "{s}: total={d} passed={d} failed={d} pass_rate={d:.2}% ci95=[{d:.2}%, {d:.2}%] mean_ms={d:.2} p50_ms={d} p95_ms={d} retried_runs={d} total_attempts={d}\n",
         .{
             label,
             stats.counts.total_runs,
@@ -298,6 +298,8 @@ fn formatStatsLine(
             stats.latency.mean_ms,
             stats.latency.p50_ms,
             stats.latency.p95_ms,
+            stats.retries.retried_runs,
+            stats.retries.total_attempts,
         },
     );
 }
@@ -794,22 +796,13 @@ fn computeDeltaConfidenceInterval(
         };
     }
 
-    const z = zScore(confidence_level);
-    const baseline_rate = passRate(baseline);
-    const candidate_rate = passRate(candidate);
-    const delta = candidate_rate - baseline_rate;
-    const baseline_n = @as(f64, @floatFromInt(baseline.total_runs));
-    const candidate_n = @as(f64, @floatFromInt(candidate.total_runs));
-    const se = @sqrt(
-        (baseline_rate * (1.0 - baseline_rate) / baseline_n) +
-            (candidate_rate * (1.0 - candidate_rate) / candidate_n),
-    );
-    const margin = z * se;
+    const baseline_ci = computePassRateConfidenceInterval(baseline, confidence_level);
+    const candidate_ci = computePassRateConfidenceInterval(candidate, confidence_level);
 
     return .{
         .confidence_level = confidence_level,
-        .low = clampDelta(delta - margin),
-        .high = clampDelta(delta + margin),
+        .low = clampDelta(candidate_ci.low - baseline_ci.high),
+        .high = clampDelta(candidate_ci.high - baseline_ci.low),
     };
 }
 
@@ -1057,6 +1050,8 @@ test "formatEvalReports includes report fields" {
     try std.testing.expect(std.mem.indexOf(u8, text, "mean_ms") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "p50_ms") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "p95_ms") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "retried_runs=1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "total_attempts=3") != null);
 }
 
 test "formatRunResultsJson writes machine readable run artifacts" {
@@ -1151,6 +1146,26 @@ test "compareServicesToBaseline computes pass-rate delta" {
     try std.testing.expectEqualStrings("baseline", comparisons.items[0].baseline_name);
     try std.testing.expectEqualStrings("candidate", comparisons.items[0].candidate_name);
     try std.testing.expectEqual(@as(f64, 0.5), comparisons.items[0].delta_pass_rate);
+}
+
+test "compareServicesToBaseline uses non-zero interval for small extreme samples" {
+    const results = [_]runner.RunResult{
+        sampleRun("smoke", "reply_ok", "baseline", "model-a", true, 10),
+        sampleRun("smoke", "reply_ok", "candidate", "model-a", false, 10),
+    };
+
+    var owned = try aggregateRunResults(std.testing.allocator, results[0..]);
+    defer owned.deinit();
+
+    var comparisons = try compareServicesToBaseline(
+        std.testing.allocator,
+        owned.items,
+        "baseline",
+    );
+    defer comparisons.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), comparisons.items.len);
+    try std.testing.expect(comparisons.items[0].delta_ci_low < comparisons.items[0].delta_ci_high);
 }
 
 test "compareModelsToBaseline computes model delta within service" {
