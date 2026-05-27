@@ -2,8 +2,8 @@
 
 `zig_eval` is a registry-driven eval tool and library. It supports
 deterministic matchers, model-graded checks, single-turn tool-calling evals,
-OpenAI-compatible chat-completions services, CLI execution, and text or JSON
-report output.
+file-backed multimodal evals, OpenAI-compatible chat-completions services, CLI
+execution, and text or JSON report output.
 
 ## Flow
 
@@ -85,7 +85,22 @@ case with an input prompt and optional expected value.
 `exact_match` and `includes` use `ideal`. `json_fields` checks the service
 output for configured root-level JSON fields.
 
-## 4. Configure Model-Graded Evals
+## 4. Add File Attachments
+
+Cases can attach files by registry-relative path. The default service client
+renders images as OpenAI-compatible image content blocks and appends text-like
+files as labeled context.
+
+```jsonl
+{"id":"case-1","input":"Summarize the attached product changelog.","ideal":"Mentions retry support and parallel execution.","attachments":[{"kind":"file","path":"assets/changelogs/release.md","mime_type":"text/markdown","label":"release notes"}]}
+{"id":"case-2","input":"What object is shown?","ideal":"red mug","attachments":[{"kind":"image","path":"assets/images/red_mug.png","mime_type":"image/png","label":"reference image"}]}
+```
+
+Built-in rendering supports PNG, JPEG, WebP, and UTF-8 text-like files such as
+`.txt`, `.md`, `.json`, `.jsonl`, `.csv`, `.zig`, `.py`, `.js`, and `.ts`.
+Other file types require a custom service adapter.
+
+## 5. Configure Model-Graded Evals
 
 Use `model_grade` for quality checks where there is no single exact expected
 answer. The runner first calls the selected product service, then sends the
@@ -136,7 +151,7 @@ Use `service_allowlist` to keep the eval targeted at product services. The
 judge service can still be used for grading even when it is not in the
 allowlist.
 
-## 5. Configure Tool-Calling Evals
+## 6. Configure Tool-Calling Evals
 
 Use `tool_call` to validate that a product selects the expected OpenAI-style
 tool and sends the expected root-level argument values. The eval definition
@@ -174,7 +189,7 @@ Extra actual tool calls and extra actual argument fields are allowed, but every
 expected tool call must be present and every expected root-level argument value
 must match exactly.
 
-## 6. Run From The CLI
+## 7. Run From The CLI
 
 List services and evals:
 
@@ -206,6 +221,12 @@ Run a tool-calling eval:
 zig build run -- run --registry examples/registry --service local-product --eval tools.search_web
 ```
 
+Run a multimodal file eval:
+
+```sh
+zig build run -- run --registry examples/registry --service local-product --eval multimodal.release_notes
+```
+
 Run with bounded parallelism while limiting concurrent requests per service:
 
 ```sh
@@ -231,7 +252,7 @@ with OpenAI-style chat completions.
 Text output prints progress lines during parallel runs. JSON output suppresses
 progress so stdout remains machine-readable.
 
-## 7. Wire The Library From Zig
+## 8. Wire The Library From Zig
 
 The CLI is the easiest path, but library users can still call the same modules
 directly.
@@ -245,8 +266,17 @@ fn evaluateMatcher(
     matcher: zig_eval.matchers.MatcherConfig,
     output: []const u8,
     ideal: ?[]const u8,
+    tool_calls: ?[]const zig_eval.services.ToolCall,
+    expected_tool_calls: ?[]const zig_eval.registry.ExpectedToolCall,
 ) anyerror!zig_eval.runner.MatcherOutcome {
-    const outcome = try zig_eval.matchers.evaluate(allocator, matcher, output, ideal);
+    const outcome = try zig_eval.matchers.evaluate(
+        allocator,
+        matcher,
+        output,
+        ideal,
+        tool_calls,
+        expected_tool_calls,
+    );
     return .{
         .passed = outcome.passed,
         .score = outcome.score,
@@ -288,6 +318,13 @@ pub fn runProductEvals(allocator: std.mem.Allocator) !void {
     var text_out = std.Io.Writer.Allocating.init(allocator);
     defer text_out.deinit();
     try zig_eval.reporting.formatEvalReports(&text_out.writer, reports.items);
+
+    var comparisons = try zig_eval.reporting.compareServicesToBaseline(
+        allocator,
+        reports.items,
+        "local-product",
+    );
+    defer comparisons.deinit();
 }
 ```
 
@@ -298,5 +335,6 @@ pub fn runProductEvals(allocator: std.mem.Allocator) !void {
 - Model-graded evals require one extra judge model call per candidate output.
 - Tool-calling evals validate tool selection and arguments only; tool execution
   and multi-turn tool-result loops are not implemented.
-- Streaming, multimodal evals, and advanced significance testing are out of
-  scope for the current implementation.
+- The default multimodal renderer supports images and text-like files only.
+- Streaming and formal p-value significance testing are out of scope for the
+  current implementation.

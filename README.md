@@ -16,10 +16,14 @@ models.
 - Evaluate exact-match, includes, and required JSON field checks.
 - Evaluate model-graded checks through a configured LLM judge service.
 - Validate single-turn OpenAI-compatible tool calls and root-level arguments.
+- Run file-backed multimodal eval cases with built-in image and text-file
+  rendering.
 - Call an OpenAI-compatible `POST /v1/chat/completions` endpoint.
 - Support authenticated and unauthenticated product endpoints.
 - Run grouped eval definitions across configured services and datasets.
 - Aggregate results into plain-text and JSON report artifacts.
+- Report Wilson 95% pass-rate confidence intervals and baseline comparison
+  statistics.
 - Run evals from the `zig_eval` CLI with service, group, eval, run-count, and
   output-format filters.
 - Run evals with bounded parallelism, per-service throttling, and retry
@@ -71,6 +75,12 @@ Run a single-turn tool-calling eval:
 
 ```sh
 zig build run -- run --registry examples/registry --service local-product --eval tools.search_web
+```
+
+Run a file-backed multimodal eval:
+
+```sh
+zig build run -- run --registry examples/registry --service local-product --eval multimodal.release_notes
 ```
 
 `run` requires the selected service endpoint to be reachable.
@@ -159,6 +169,7 @@ It includes:
 - one structured-output eval using `json_fields`
 - one quality eval using `model_grade`
 - one tool eval using `tool_call`
+- two multimodal evals using text and image attachments
 
 ## Model-Graded Evals
 
@@ -181,6 +192,24 @@ the tool schema, and dataset cases provide expected tool calls.
 V3 validates tool selection and arguments only. It does not execute tools,
 simulate tool results, or run a multi-turn agent loop.
 
+## Multimodal File Evals
+
+Dataset cases may include file attachments. The default OpenAI-compatible
+client renders PNG, JPEG, and WebP images as image content blocks, and appends
+UTF-8 text-like files as labeled prompt context. PDFs, audio, video, archives,
+and arbitrary binaries are available to custom adapters but are not rendered by
+the default client.
+
+Attachment paths are resolved inside the registry root and are limited to 5 MB
+per file.
+
+## Advanced Statistics
+
+Aggregate reports include Wilson 95% confidence intervals for pass rate at the
+eval, service, and model levels. Library users can also compare services or
+models against a baseline to get descriptive pass-rate deltas with confidence
+intervals.
+
 ## Retry policy
 
 Services may define retry behavior:
@@ -197,13 +226,14 @@ Services may define retry behavior:
 
 ## Design Direction
 
-The v1 focus is a small, stable core:
+The current focus is a small, stable core:
 
 - OpenAI-compatible chat execution.
 - Product-neutral service configuration.
 - Capability-based eval grouping.
 - Deterministic matchers plus V2 model-graded judging.
 - V3 single-turn tool-call validation.
+- V4 file-backed multimodal evals and confidence interval reporting.
 - Clear ownership of allocated data in public APIs.
 
 ## Resources

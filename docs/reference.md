@@ -15,6 +15,8 @@ examples/registry
     `-- <group>
         `-- <eval>
             `-- <split>.jsonl
+`-- assets
+    `-- <project files used by dataset attachments>
 ```
 
 `loadAllEvalDefinitions` recursively discovers `.json` files under the evals
@@ -155,6 +157,7 @@ Datasets are newline-delimited JSON. Each non-empty line is one case.
 | `input` | yes | Prompt sent to the service as the user message. |
 | `ideal` | no | Expected value used by matcher implementations. |
 | `expected_tool_calls` | no | Expected OpenAI-style tool call names and optional root-level argument values. |
+| `attachments` | no | Files attached to the case and resolved relative to the registry root. |
 
 Example:
 
@@ -171,6 +174,25 @@ Tool-calling case example:
 For `expected_tool_calls[*].arguments_json`, every expected root-level field
 must exist in the actual tool arguments and have the same JSON value. Extra
 actual argument fields are allowed.
+
+Attachment example:
+
+```jsonl
+{"id":"case-1","input":"Summarize the attached changelog.","ideal":"Mentions retries.","attachments":[{"kind":"file","path":"assets/changelogs/release.md","mime_type":"text/markdown","label":"release notes"}]}
+```
+
+Attachment fields:
+
+| Field | Required | Meaning |
+| --- | --- | --- |
+| `kind` | yes | `image` or `file`. |
+| `path` | yes | Registry-relative file path. Absolute paths and `..` segments are rejected. |
+| `mime_type` | no | Explicit MIME type. If omitted, it is inferred for supported extensions. |
+| `label` | no | Human-readable label used when rendering text attachments. |
+
+The default renderer supports PNG, JPEG, WebP, and UTF-8 text-like files. Each
+attachment is limited to `5 MB`. Unsupported binary file types require a custom
+service adapter.
 
 ## Runner Output
 
@@ -195,7 +217,7 @@ Service call failures are converted into failed run results with
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "runs": [
     {
       "group": "smoke",
@@ -220,7 +242,7 @@ Service call failures are converted into failed run results with
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "evals": [
     {
       "group": "smoke",
@@ -232,6 +254,9 @@ Service call failures are converted into failed run results with
           "failed": 0
         },
         "pass_rate": 1,
+        "confidence_level": 0.95,
+        "pass_rate_ci_low": 0.34,
+        "pass_rate_ci_high": 1,
         "latency": {
           "mean_ms": 42,
           "p50_ms": 40,
@@ -248,4 +273,28 @@ Service call failures are converted into failed run results with
 }
 ```
 
-The current schema version is `1`.
+`reporting.formatBaselineComparisonsJson` writes baseline comparison artifacts:
+
+```json
+{
+  "schema_version": 2,
+  "baseline_comparisons": [
+    {
+      "group": "smoke",
+      "eval_id": "smoke.reply_ok",
+      "target_kind": "service",
+      "service_name": null,
+      "baseline_name": "local-product",
+      "candidate_name": "product-staging",
+      "baseline_pass_rate": 0.8,
+      "candidate_pass_rate": 0.9,
+      "delta_pass_rate": 0.1,
+      "delta_ci_low": -0.1,
+      "delta_ci_high": 0.3,
+      "confidence_level": 0.95
+    }
+  ]
+}
+```
+
+The current schema version is `2`.
