@@ -18,11 +18,45 @@ pub const RetryStats = struct {
     total_attempts: usize,
 };
 
+pub const ConfidenceInterval = struct {
+    confidence_level: f64,
+    low: f64,
+    high: f64,
+};
+
 pub const AggregateStats = struct {
     counts: AggregateCounts,
     pass_rate: f64,
+    confidence: ConfidenceInterval,
     latency: LatencyStats,
     retries: RetryStats,
+};
+
+pub const BaselineComparison = struct {
+    group: []const u8,
+    eval_id: []const u8,
+    target_kind: []const u8,
+    service_name: ?[]const u8 = null,
+    baseline_name: []const u8,
+    candidate_name: []const u8,
+    baseline_pass_rate: f64,
+    candidate_pass_rate: f64,
+    delta_pass_rate: f64,
+    delta_ci_low: f64,
+    delta_ci_high: f64,
+    confidence_level: f64,
+};
+
+pub const OwnedBaselineComparisons = struct {
+    parent_allocator: std.mem.Allocator,
+    arena: *std.heap.ArenaAllocator,
+    items: []const BaselineComparison,
+
+    pub fn deinit(self: *OwnedBaselineComparisons) void {
+        self.arena.deinit();
+        self.parent_allocator.destroy(self.arena);
+        self.* = undefined;
+    }
 };
 
 pub const ModelReport = struct {
@@ -55,7 +89,8 @@ pub const OwnedEvalReports = struct {
     }
 };
 
-pub const json_schema_version: u32 = 1;
+pub const json_schema_version: u32 = 2;
+pub const default_confidence_level: f64 = 0.95;
 
 pub fn aggregateRunResults(
     allocator: std.mem.Allocator,
@@ -129,6 +164,105 @@ pub fn formatEvalReportsJson(writer: anytype, reports: []const EvalReport) !void
     try json_writer.endObject();
 }
 
+pub fn compareServicesToBaseline(
+    allocator: std.mem.Allocator,
+    reports: []const EvalReport,
+    baseline_service: []const u8,
+) !OwnedBaselineComparisons {
+    const arena = try allocator.create(std.heap.ArenaAllocator);
+    arena.* = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    errdefer allocator.destroy(arena);
+
+    var items = std.ArrayList(BaselineComparison){};
+    defer items.deinit(allocator);
+
+    for (reports) |report| {
+        const baseline = findServiceReport(report.services, baseline_service) orelse continue;
+        for (report.services) |service| {
+            if (std.mem.eql(u8, service.service_name, baseline_service)) continue;
+            try items.append(allocator, try buildBaselineComparison(
+                arena.allocator(),
+                report.group,
+                report.eval_id,
+                "service",
+                null,
+                baseline_service,
+                service.service_name,
+                baseline.stats.counts,
+                service.stats.counts,
+            ));
+        }
+    }
+
+    return .{
+        .parent_allocator = allocator,
+        .arena = arena,
+        .items = try arena.allocator().dupe(BaselineComparison, items.items),
+    };
+}
+
+pub fn compareModelsToBaseline(
+    allocator: std.mem.Allocator,
+    reports: []const EvalReport,
+    baseline_model: []const u8,
+) !OwnedBaselineComparisons {
+    const arena = try allocator.create(std.heap.ArenaAllocator);
+    arena.* = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    errdefer allocator.destroy(arena);
+
+    var items = std.ArrayList(BaselineComparison){};
+    defer items.deinit(allocator);
+
+    for (reports) |report| {
+        for (report.services) |service| {
+            const baseline = findModelReport(service.models, baseline_model) orelse continue;
+            for (service.models) |model| {
+                if (std.mem.eql(u8, model.model, baseline_model)) continue;
+                try items.append(allocator, try buildBaselineComparison(
+                    arena.allocator(),
+                    report.group,
+                    report.eval_id,
+                    "model",
+                    service.service_name,
+                    baseline_model,
+                    model.model,
+                    baseline.stats.counts,
+                    model.stats.counts,
+                ));
+            }
+        }
+    }
+
+    return .{
+        .parent_allocator = allocator,
+        .arena = arena,
+        .items = try arena.allocator().dupe(BaselineComparison, items.items),
+    };
+}
+
+pub fn formatBaselineComparisonsJson(
+    writer: anytype,
+    comparisons: []const BaselineComparison,
+) !void {
+    var json_writer = std.json.Stringify{
+        .writer = writer,
+        .options = .{},
+    };
+
+    try json_writer.beginObject();
+    try json_writer.objectField("schema_version");
+    try json_writer.write(json_schema_version);
+    try json_writer.objectField("baseline_comparisons");
+    try json_writer.beginArray();
+    for (comparisons) |comparison| {
+        try writeBaselineComparisonJson(&json_writer, comparison);
+    }
+    try json_writer.endArray();
+    try json_writer.endObject();
+}
+
 pub fn formatEvalReport(writer: anytype, report: EvalReport) !void {
     try writer.print("eval {s} group={s}\n", .{ report.eval_id, report.group });
     try formatStatsLine(writer, "summary", report.stats, 2);
@@ -152,13 +286,15 @@ fn formatStatsLine(
 ) !void {
     try writer.splatByteAll(' ', indent);
     try writer.print(
-        "{s}: total={d} passed={d} failed={d} pass_rate={d:.2}% mean_ms={d:.2} p50_ms={d} p95_ms={d}\n",
+        "{s}: total={d} passed={d} failed={d} pass_rate={d:.2}% ci95=[{d:.2}%, {d:.2}%] mean_ms={d:.2} p50_ms={d} p95_ms={d}\n",
         .{
             label,
             stats.counts.total_runs,
             stats.counts.passed,
             stats.counts.failed,
             stats.pass_rate * 100.0,
+            stats.confidence.low * 100.0,
+            stats.confidence.high * 100.0,
             stats.latency.mean_ms,
             stats.latency.p50_ms,
             stats.latency.p95_ms,
@@ -251,10 +387,52 @@ fn writeAggregateStatsJson(json_writer: *std.json.Stringify, stats: AggregateSta
     try writeAggregateCountsJson(json_writer, stats.counts);
     try json_writer.objectField("pass_rate");
     try json_writer.write(stats.pass_rate);
+    try json_writer.objectField("confidence_level");
+    try json_writer.write(stats.confidence.confidence_level);
+    try json_writer.objectField("pass_rate_ci_low");
+    try json_writer.write(stats.confidence.low);
+    try json_writer.objectField("pass_rate_ci_high");
+    try json_writer.write(stats.confidence.high);
     try json_writer.objectField("latency");
     try writeLatencyStatsJson(json_writer, stats.latency);
     try json_writer.objectField("retries");
     try writeRetryStatsJson(json_writer, stats.retries);
+    try json_writer.endObject();
+}
+
+fn writeBaselineComparisonJson(
+    json_writer: *std.json.Stringify,
+    comparison: BaselineComparison,
+) !void {
+    try json_writer.beginObject();
+    try json_writer.objectField("group");
+    try json_writer.write(comparison.group);
+    try json_writer.objectField("eval_id");
+    try json_writer.write(comparison.eval_id);
+    try json_writer.objectField("target_kind");
+    try json_writer.write(comparison.target_kind);
+    try json_writer.objectField("service_name");
+    if (comparison.service_name) |service_name| {
+        try json_writer.write(service_name);
+    } else {
+        try json_writer.write(@as(?[]const u8, null));
+    }
+    try json_writer.objectField("baseline_name");
+    try json_writer.write(comparison.baseline_name);
+    try json_writer.objectField("candidate_name");
+    try json_writer.write(comparison.candidate_name);
+    try json_writer.objectField("baseline_pass_rate");
+    try json_writer.write(comparison.baseline_pass_rate);
+    try json_writer.objectField("candidate_pass_rate");
+    try json_writer.write(comparison.candidate_pass_rate);
+    try json_writer.objectField("delta_pass_rate");
+    try json_writer.write(comparison.delta_pass_rate);
+    try json_writer.objectField("delta_ci_low");
+    try json_writer.write(comparison.delta_ci_low);
+    try json_writer.objectField("delta_ci_high");
+    try json_writer.write(comparison.delta_ci_high);
+    try json_writer.objectField("confidence_level");
+    try json_writer.write(comparison.confidence_level);
     try json_writer.endObject();
 }
 
@@ -323,6 +501,7 @@ const Accumulator = struct {
         return .{
             .counts = self.counts,
             .pass_rate = passRate(self.counts),
+            .confidence = computePassRateConfidenceInterval(self.counts, default_confidence_level),
             .latency = try computeLatencyStats(allocator, self.latencies.items),
             .retries = .{
                 .retried_runs = self.retried_runs,
@@ -378,6 +557,56 @@ fn deinitEvalBuilders(
         builder.deinit(allocator);
     }
     builders.deinit(allocator);
+}
+
+fn findServiceReport(services: []const ServiceReport, service_name: []const u8) ?ServiceReport {
+    for (services) |service| {
+        if (std.mem.eql(u8, service.service_name, service_name)) return service;
+    }
+    return null;
+}
+
+fn findModelReport(models: []const ModelReport, model_name: []const u8) ?ModelReport {
+    for (models) |model| {
+        if (std.mem.eql(u8, model.model, model_name)) return model;
+    }
+    return null;
+}
+
+fn buildBaselineComparison(
+    allocator: std.mem.Allocator,
+    group: []const u8,
+    eval_id: []const u8,
+    target_kind: []const u8,
+    service_name: ?[]const u8,
+    baseline_name: []const u8,
+    candidate_name: []const u8,
+    baseline_counts: AggregateCounts,
+    candidate_counts: AggregateCounts,
+) !BaselineComparison {
+    const baseline_pass_rate = passRate(baseline_counts);
+    const candidate_pass_rate = passRate(candidate_counts);
+    const delta = candidate_pass_rate - baseline_pass_rate;
+    const delta_ci = computeDeltaConfidenceInterval(
+        baseline_counts,
+        candidate_counts,
+        default_confidence_level,
+    );
+
+    return .{
+        .group = try allocator.dupe(u8, group),
+        .eval_id = try allocator.dupe(u8, eval_id),
+        .target_kind = target_kind,
+        .service_name = if (service_name) |name| try allocator.dupe(u8, name) else null,
+        .baseline_name = try allocator.dupe(u8, baseline_name),
+        .candidate_name = try allocator.dupe(u8, candidate_name),
+        .baseline_pass_rate = baseline_pass_rate,
+        .candidate_pass_rate = candidate_pass_rate,
+        .delta_pass_rate = delta,
+        .delta_ci_low = delta_ci.low,
+        .delta_ci_high = delta_ci.high,
+        .confidence_level = default_confidence_level,
+    };
 }
 
 fn appendRunResult(
@@ -525,6 +754,78 @@ fn passRate(counts: AggregateCounts) f64 {
     return @as(f64, @floatFromInt(counts.passed)) / @as(f64, @floatFromInt(counts.total_runs));
 }
 
+fn computePassRateConfidenceInterval(
+    counts: AggregateCounts,
+    confidence_level: f64,
+) ConfidenceInterval {
+    if (counts.total_runs == 0) {
+        return .{
+            .confidence_level = confidence_level,
+            .low = 0.0,
+            .high = 0.0,
+        };
+    }
+
+    const z = zScore(confidence_level);
+    const n = @as(f64, @floatFromInt(counts.total_runs));
+    const p = passRate(counts);
+    const z2 = z * z;
+    const denominator = 1.0 + z2 / n;
+    const center = (p + z2 / (2.0 * n)) / denominator;
+    const margin = (z * @sqrt((p * (1.0 - p) + z2 / (4.0 * n)) / n)) / denominator;
+
+    return .{
+        .confidence_level = confidence_level,
+        .low = clampRate(center - margin),
+        .high = clampRate(center + margin),
+    };
+}
+
+fn computeDeltaConfidenceInterval(
+    baseline: AggregateCounts,
+    candidate: AggregateCounts,
+    confidence_level: f64,
+) ConfidenceInterval {
+    if (baseline.total_runs == 0 or candidate.total_runs == 0) {
+        return .{
+            .confidence_level = confidence_level,
+            .low = 0.0,
+            .high = 0.0,
+        };
+    }
+
+    const z = zScore(confidence_level);
+    const baseline_rate = passRate(baseline);
+    const candidate_rate = passRate(candidate);
+    const delta = candidate_rate - baseline_rate;
+    const baseline_n = @as(f64, @floatFromInt(baseline.total_runs));
+    const candidate_n = @as(f64, @floatFromInt(candidate.total_runs));
+    const se = @sqrt(
+        (baseline_rate * (1.0 - baseline_rate) / baseline_n) +
+            (candidate_rate * (1.0 - candidate_rate) / candidate_n),
+    );
+    const margin = z * se;
+
+    return .{
+        .confidence_level = confidence_level,
+        .low = clampDelta(delta - margin),
+        .high = clampDelta(delta + margin),
+    };
+}
+
+fn zScore(confidence_level: f64) f64 {
+    _ = confidence_level;
+    return 1.959963984540054;
+}
+
+fn clampRate(value: f64) f64 {
+    return @max(0.0, @min(1.0, value));
+}
+
+fn clampDelta(value: f64) f64 {
+    return @max(-1.0, @min(1.0, value));
+}
+
 fn computeLatencyStats(
     allocator: std.mem.Allocator,
     latencies: []const u64,
@@ -596,6 +897,11 @@ test "EvalReport stores grouped report shapes" {
                     .failed = 1,
                 },
                 .pass_rate = 0.9,
+                .confidence = .{
+                    .confidence_level = 0.95,
+                    .low = 0.6,
+                    .high = 0.98,
+                },
                 .latency = .{
                     .mean_ms = 100.0,
                     .p50_ms = 95,
@@ -694,6 +1000,40 @@ test "computeLatencyStats calculates mean p50 and p95" {
     try std.testing.expectEqual(@as(u64, 40), stats.p95_ms);
 }
 
+test "computePassRateConfidenceInterval handles common result shapes" {
+    const empty = computePassRateConfidenceInterval(.{
+        .total_runs = 0,
+        .passed = 0,
+        .failed = 0,
+    }, default_confidence_level);
+    try std.testing.expectEqual(@as(f64, 0.0), empty.low);
+    try std.testing.expectEqual(@as(f64, 0.0), empty.high);
+
+    const all_pass = computePassRateConfidenceInterval(.{
+        .total_runs = 4,
+        .passed = 4,
+        .failed = 0,
+    }, default_confidence_level);
+    try std.testing.expect(all_pass.low > 0.45);
+    try std.testing.expectEqual(@as(f64, 1.0), all_pass.high);
+
+    const all_fail = computePassRateConfidenceInterval(.{
+        .total_runs = 4,
+        .passed = 0,
+        .failed = 4,
+    }, default_confidence_level);
+    try std.testing.expectEqual(@as(f64, 0.0), all_fail.low);
+    try std.testing.expect(all_fail.high < 0.55);
+
+    const mixed = computePassRateConfidenceInterval(.{
+        .total_runs = 2,
+        .passed = 1,
+        .failed = 1,
+    }, default_confidence_level);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0945), mixed.low, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.9055), mixed.high, 0.001);
+}
+
 test "formatEvalReports includes report fields" {
     const results = [_]runner.RunResult{
         sampleRun("smoke", "reply_ok", "product-api", "model-a", true, 10),
@@ -713,6 +1053,7 @@ test "formatEvalReports includes report fields" {
     try std.testing.expect(std.mem.indexOf(u8, text, "product-api") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "model-a") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "pass_rate") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "ci95") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "mean_ms") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "p50_ms") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "p95_ms") != null);
@@ -774,6 +1115,9 @@ test "formatEvalReportsJson writes grouped aggregate artifacts" {
     try std.testing.expectEqualStrings("reply_ok", eval_report.get("eval_id").?.string);
     const eval_stats = eval_report.get("stats").?.object;
     try std.testing.expectEqual(@as(i64, 2), eval_stats.get("counts").?.object.get("total_runs").?.integer);
+    try std.testing.expectEqual(@as(f64, 0.95), eval_stats.get("confidence_level").?.float);
+    try std.testing.expect(eval_stats.get("pass_rate_ci_low") != null);
+    try std.testing.expect(eval_stats.get("pass_rate_ci_high") != null);
     try std.testing.expectEqual(@as(i64, 1), eval_stats.get("retries").?.object.get("retried_runs").?.integer);
     try std.testing.expectEqual(@as(i64, 3), eval_stats.get("retries").?.object.get("total_attempts").?.integer);
 
@@ -783,4 +1127,83 @@ test "formatEvalReportsJson writes grouped aggregate artifacts" {
     const model_reports = service_reports[0].object.get("models").?.array.items;
     try std.testing.expectEqualStrings("model-a", model_reports[0].object.get("model").?.string);
     try std.testing.expectEqual(@as(i64, 30), model_reports[0].object.get("stats").?.object.get("latency").?.object.get("p95_ms").?.integer);
+}
+
+test "compareServicesToBaseline computes pass-rate delta" {
+    const results = [_]runner.RunResult{
+        sampleRun("smoke", "reply_ok", "baseline", "model-a", true, 10),
+        sampleRun("smoke", "reply_ok", "baseline", "model-a", false, 10),
+        sampleRun("smoke", "reply_ok", "candidate", "model-a", true, 10),
+        sampleRun("smoke", "reply_ok", "candidate", "model-a", true, 10),
+    };
+
+    var owned = try aggregateRunResults(std.testing.allocator, results[0..]);
+    defer owned.deinit();
+
+    var comparisons = try compareServicesToBaseline(
+        std.testing.allocator,
+        owned.items,
+        "baseline",
+    );
+    defer comparisons.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), comparisons.items.len);
+    try std.testing.expectEqualStrings("baseline", comparisons.items[0].baseline_name);
+    try std.testing.expectEqualStrings("candidate", comparisons.items[0].candidate_name);
+    try std.testing.expectEqual(@as(f64, 0.5), comparisons.items[0].delta_pass_rate);
+}
+
+test "compareModelsToBaseline computes model delta within service" {
+    const results = [_]runner.RunResult{
+        sampleRun("smoke", "reply_ok", "product-api", "baseline-model", true, 10),
+        sampleRun("smoke", "reply_ok", "product-api", "baseline-model", false, 10),
+        sampleRun("smoke", "reply_ok", "product-api", "candidate-model", true, 10),
+        sampleRun("smoke", "reply_ok", "product-api", "candidate-model", true, 10),
+    };
+
+    var owned = try aggregateRunResults(std.testing.allocator, results[0..]);
+    defer owned.deinit();
+
+    var comparisons = try compareModelsToBaseline(
+        std.testing.allocator,
+        owned.items,
+        "baseline-model",
+    );
+    defer comparisons.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), comparisons.items.len);
+    try std.testing.expectEqualStrings("model", comparisons.items[0].target_kind);
+    try std.testing.expectEqualStrings("product-api", comparisons.items[0].service_name.?);
+    try std.testing.expectEqual(@as(f64, 0.5), comparisons.items[0].delta_pass_rate);
+}
+
+test "formatBaselineComparisonsJson writes comparison artifact" {
+    const results = [_]runner.RunResult{
+        sampleRun("smoke", "reply_ok", "baseline", "model-a", true, 10),
+        sampleRun("smoke", "reply_ok", "candidate", "model-a", false, 10),
+    };
+
+    var owned = try aggregateRunResults(std.testing.allocator, results[0..]);
+    defer owned.deinit();
+
+    var comparisons = try compareServicesToBaseline(
+        std.testing.allocator,
+        owned.items,
+        "baseline",
+    );
+    defer comparisons.deinit();
+
+    var out = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer out.deinit();
+    try formatBaselineComparisonsJson(&out.writer, comparisons.items);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, out.written(), .{});
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+    try std.testing.expectEqual(@as(i64, json_schema_version), root.get("schema_version").?.integer);
+    const comparison = root.get("baseline_comparisons").?.array.items[0].object;
+    try std.testing.expectEqualStrings("service", comparison.get("target_kind").?.string);
+    try std.testing.expect(comparison.get("delta_ci_low") != null);
+    try std.testing.expect(comparison.get("delta_ci_high") != null);
 }
