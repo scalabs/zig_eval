@@ -37,6 +37,8 @@ pub const ChatCallInput = struct {
     system_prompt_override: ?[]const u8 = null,
     model_override: ?[]const u8 = null,
     tools: ?[]const registry.ToolDefinition = null,
+    attachments: ?[]const registry.Attachment = null,
+    attachment_dir: ?std.fs.Dir = null,
 };
 
 pub const ToolCall = struct {
@@ -138,6 +140,8 @@ pub fn callChatCompletion(
         system_prompt,
         service.provider,
         input.tools,
+        input.attachment_dir,
+        input.attachments,
     );
     defer allocator.free(payload);
 
@@ -310,6 +314,8 @@ fn renderChatPayloadJsonAlloc(
     system_prompt: ?[]const u8,
     provider: ?[]const u8,
     tools: ?[]const registry.ToolDefinition,
+    attachment_dir: ?std.fs.Dir,
+    attachments: ?[]const registry.Attachment,
 ) ![]u8 {
     var out = std.Io.Writer.Allocating.init(allocator);
     errdefer out.deinit();
@@ -330,7 +336,7 @@ fn renderChatPayloadJsonAlloc(
     if (system_prompt) |value| {
         try writeMessageObject(&json_writer, "system", value);
     }
-    try writeMessageObject(&json_writer, "user", prompt);
+    try writeUserMessageObject(&json_writer, allocator, attachment_dir, prompt, attachments);
     try json_writer.endArray();
 
     if (tools) |tool_list| {
@@ -397,6 +403,142 @@ fn writeMessageObject(
     try json_writer.objectField("content");
     try json_writer.write(content);
     try json_writer.endObject();
+}
+
+fn writeUserMessageObject(
+    json_writer: *std.json.Stringify,
+    allocator: std.mem.Allocator,
+    attachment_dir: ?std.fs.Dir,
+    prompt: []const u8,
+    attachments: ?[]const registry.Attachment,
+) !void {
+    const attachment_list = attachments orelse {
+        try writeMessageObject(json_writer, "user", prompt);
+        return;
+    };
+    if (attachment_list.len == 0) {
+        try writeMessageObject(json_writer, "user", prompt);
+        return;
+    }
+
+    const dir = attachment_dir orelse return error.MissingAttachmentRoot;
+    const text_content = try buildTextContentWithAttachments(allocator, dir, prompt, attachment_list);
+    defer allocator.free(text_content);
+
+    try json_writer.beginObject();
+    try json_writer.objectField("role");
+    try json_writer.write("user");
+    try json_writer.objectField("content");
+    try json_writer.beginArray();
+
+    try writeTextContentBlock(json_writer, text_content);
+
+    for (attachment_list) |attachment| {
+        const mime_type = attachmentMimeType(attachment) orelse return error.UnsupportedAttachmentType;
+        if (attachment.kind == .image or isImageMimeType(mime_type)) {
+            try writeImageContentBlock(json_writer, allocator, dir, attachment, mime_type);
+        } else if (!isTextMimeType(mime_type)) {
+            return error.UnsupportedAttachmentType;
+        }
+    }
+
+    try json_writer.endArray();
+    try json_writer.endObject();
+}
+
+fn buildTextContentWithAttachments(
+    allocator: std.mem.Allocator,
+    dir: std.fs.Dir,
+    prompt: []const u8,
+    attachments: []const registry.Attachment,
+) ![]u8 {
+    var out = std.Io.Writer.Allocating.init(allocator);
+    errdefer out.deinit();
+
+    try out.writer.writeAll(prompt);
+
+    for (attachments) |attachment| {
+        const mime_type = attachmentMimeType(attachment) orelse return error.UnsupportedAttachmentType;
+        if (attachment.kind == .image or isImageMimeType(mime_type)) continue;
+        if (!isTextMimeType(mime_type)) return error.UnsupportedAttachmentType;
+
+        const raw = try dir.readFileAlloc(allocator, attachment.path, registry.max_attachment_bytes);
+        defer allocator.free(raw);
+        if (!std.unicode.utf8ValidateSlice(raw)) return error.InvalidAttachmentText;
+
+        const label = attachment.label orelse attachment.path;
+        try out.writer.print(
+            "\n\n[Attachment: {s} ({s})]\n```text\n{s}\n```",
+            .{ label, mime_type, raw },
+        );
+    }
+
+    return try out.toOwnedSlice();
+}
+
+fn writeTextContentBlock(
+    json_writer: *std.json.Stringify,
+    text: []const u8,
+) !void {
+    try json_writer.beginObject();
+    try json_writer.objectField("type");
+    try json_writer.write("text");
+    try json_writer.objectField("text");
+    try json_writer.write(text);
+    try json_writer.endObject();
+}
+
+fn writeImageContentBlock(
+    json_writer: *std.json.Stringify,
+    allocator: std.mem.Allocator,
+    dir: std.fs.Dir,
+    attachment: registry.Attachment,
+    mime_type: []const u8,
+) !void {
+    const data_url = try imageDataUrl(allocator, dir, attachment.path, mime_type);
+    defer allocator.free(data_url);
+
+    try json_writer.beginObject();
+    try json_writer.objectField("type");
+    try json_writer.write("image_url");
+    try json_writer.objectField("image_url");
+    try json_writer.beginObject();
+    try json_writer.objectField("url");
+    try json_writer.write(data_url);
+    try json_writer.endObject();
+    try json_writer.endObject();
+}
+
+fn imageDataUrl(
+    allocator: std.mem.Allocator,
+    dir: std.fs.Dir,
+    path: []const u8,
+    mime_type: []const u8,
+) ![]u8 {
+    const raw = try dir.readFileAlloc(allocator, path, registry.max_attachment_bytes);
+    defer allocator.free(raw);
+
+    const encoded = try allocator.alloc(u8, std.base64.standard.Encoder.calcSize(raw.len));
+    defer allocator.free(encoded);
+    const encoded_slice = std.base64.standard.Encoder.encode(encoded, raw);
+
+    return std.fmt.allocPrint(allocator, "data:{s};base64,{s}", .{ mime_type, encoded_slice });
+}
+
+fn attachmentMimeType(attachment: registry.Attachment) ?[]const u8 {
+    return attachment.mime_type orelse registry.inferAttachmentMimeType(attachment.path);
+}
+
+fn isImageMimeType(mime_type: []const u8) bool {
+    return std.mem.eql(u8, mime_type, "image/png") or
+        std.mem.eql(u8, mime_type, "image/jpeg") or
+        std.mem.eql(u8, mime_type, "image/webp");
+}
+
+fn isTextMimeType(mime_type: []const u8) bool {
+    return std.mem.startsWith(u8, mime_type, "text/") or
+        std.mem.eql(u8, mime_type, "application/json") or
+        std.mem.eql(u8, mime_type, "application/x-ndjson");
 }
 
 fn parseToolCalls(
@@ -799,6 +941,8 @@ test "renderChatPayloadJsonAlloc includes messages stream and provider" {
         "Follow instructions exactly.",
         "openai",
         null,
+        null,
+        null,
     );
     defer std.testing.allocator.free(payload);
 
@@ -919,6 +1063,8 @@ test "renderChatPayloadJsonAlloc includes tools" {
         null,
         "openai",
         tools[0..],
+        null,
+        null,
     );
     defer std.testing.allocator.free(payload);
 
@@ -948,6 +1094,124 @@ test "renderChatPayloadJsonAlloc includes tools" {
     try std.testing.expectEqualStrings(
         "search_web",
         function.get("name").?.string,
+    );
+}
+
+test "renderChatPayloadJsonAlloc includes image attachments" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("assets/images");
+    try tmp.dir.writeFile(.{
+        .sub_path = "assets/images/red_mug.png",
+        .data = "png",
+    });
+
+    const attachments = [_]registry.Attachment{
+        .{
+            .kind = .image,
+            .path = "assets/images/red_mug.png",
+            .mime_type = "image/png",
+            .label = "reference image",
+        },
+    };
+
+    const payload = try renderChatPayloadJsonAlloc(
+        std.testing.allocator,
+        "gpt-4.1-mini",
+        "What object is shown?",
+        null,
+        null,
+        null,
+        tmp.dir,
+        attachments[0..],
+    );
+    defer std.testing.allocator.free(payload);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+
+    const message = parsed.value.object.get("messages").?.array.items[0].object;
+    const content = message.get("content").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), content.len);
+    try std.testing.expectEqualStrings("text", content[0].object.get("type").?.string);
+    try std.testing.expectEqualStrings("image_url", content[1].object.get("type").?.string);
+    const url = content[1].object.get("image_url").?.object.get("url").?.string;
+    try std.testing.expect(std.mem.startsWith(u8, url, "data:image/png;base64,"));
+}
+
+test "renderChatPayloadJsonAlloc appends text attachments" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("assets/changelogs");
+    try tmp.dir.writeFile(.{
+        .sub_path = "assets/changelogs/release.md",
+        .data = "Retry support and parallel execution shipped.\n",
+    });
+
+    const attachments = [_]registry.Attachment{
+        .{
+            .kind = .file,
+            .path = "assets/changelogs/release.md",
+            .mime_type = "text/markdown",
+            .label = "release notes",
+        },
+    };
+
+    const payload = try renderChatPayloadJsonAlloc(
+        std.testing.allocator,
+        "gpt-4.1-mini",
+        "Summarize the attached changelog.",
+        null,
+        null,
+        null,
+        tmp.dir,
+        attachments[0..],
+    );
+    defer std.testing.allocator.free(payload);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+
+    const message = parsed.value.object.get("messages").?.array.items[0].object;
+    const content = message.get("content").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), content.len);
+    const text = content[0].object.get("text").?.string;
+    try std.testing.expect(std.mem.indexOf(u8, text, "release notes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Retry support") != null);
+}
+
+test "renderChatPayloadJsonAlloc rejects unsupported binary attachments" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("assets/files");
+    try tmp.dir.writeFile(.{
+        .sub_path = "assets/files/spec.pdf",
+        .data = "%PDF-placeholder",
+    });
+
+    const attachments = [_]registry.Attachment{
+        .{
+            .kind = .file,
+            .path = "assets/files/spec.pdf",
+            .mime_type = "application/pdf",
+        },
+    };
+
+    try std.testing.expectError(
+        error.UnsupportedAttachmentType,
+        renderChatPayloadJsonAlloc(
+            std.testing.allocator,
+            "gpt-4.1-mini",
+            "Summarize the attachment.",
+            null,
+            null,
+            null,
+            tmp.dir,
+            attachments[0..],
+        ),
     );
 }
 
