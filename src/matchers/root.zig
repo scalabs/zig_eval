@@ -136,10 +136,10 @@ pub fn parseMatcherConfig(
     }
 
     if (std.mem.eql(u8, kind_text, "tool_call")) {
-       try validateFields(object, &.{ "kind" });
+        try validateFields(object, &.{"kind"});
 
-       return .{
-         .tool_call = .{},
+        return .{
+            .tool_call = .{},
         };
     }
 
@@ -160,9 +160,9 @@ pub fn evaluate(
         .json_fields => |config| evaluateJsonFields(allocator, config, output),
         .model_grade => error.ModelGradeRequiresJudge,
         .tool_call => evaluateToolCalls(
-           allocator,
-           tool_calls,
-           expected_tool_calls,
+            allocator,
+            tool_calls,
+            expected_tool_calls,
         ),
     };
 }
@@ -271,8 +271,11 @@ fn evaluateToolCalls(
                 var iter = expected_object.iterator();
 
                 while (iter.next()) |entry| {
-                    if (actual_args_object.get(entry.key_ptr.*) == null) {
+                    const actual_value = actual_args_object.get(entry.key_ptr.*) orelse {
                         return failed("missing expected argument field");
+                    };
+                    if (!jsonValuesEqual(entry.value_ptr.*, actual_value)) {
+                        return failed("tool argument value mismatch");
                     }
                 }
             }
@@ -286,6 +289,54 @@ fn evaluateToolCalls(
     }
 
     return passed();
+}
+
+fn jsonValuesEqual(expected: std.json.Value, actual: std.json.Value) bool {
+    return switch (expected) {
+        .null => actual == .null,
+        .bool => |value| switch (actual) {
+            .bool => |actual_value| actual_value == value,
+            else => false,
+        },
+        .integer => |value| switch (actual) {
+            .integer => |actual_value| actual_value == value,
+            else => false,
+        },
+        .float => |value| switch (actual) {
+            .float => |actual_value| actual_value == value,
+            else => false,
+        },
+        .number_string => |value| switch (actual) {
+            .number_string => |actual_value| std.mem.eql(u8, actual_value, value),
+            else => false,
+        },
+        .string => |value| switch (actual) {
+            .string => |actual_value| std.mem.eql(u8, actual_value, value),
+            else => false,
+        },
+        .array => |expected_array| switch (actual) {
+            .array => |actual_array| blk: {
+                if (expected_array.items.len != actual_array.items.len) break :blk false;
+                for (expected_array.items, actual_array.items) |expected_item, actual_item| {
+                    if (!jsonValuesEqual(expected_item, actual_item)) break :blk false;
+                }
+                break :blk true;
+            },
+            else => false,
+        },
+        .object => |expected_object| switch (actual) {
+            .object => |actual_object| blk: {
+                if (expected_object.count() != actual_object.count()) break :blk false;
+                var iter = expected_object.iterator();
+                while (iter.next()) |entry| {
+                    const actual_value = actual_object.get(entry.key_ptr.*) orelse break :blk false;
+                    if (!jsonValuesEqual(entry.value_ptr.*, actual_value)) break :blk false;
+                }
+                break :blk true;
+            },
+            else => false,
+        },
+    };
 }
 
 fn normalizeText(text: []const u8, options: TextMatchOptions) []const u8 {
@@ -480,7 +531,8 @@ test "parseMatcherConfig parses all matcher kinds" {
 
         const config = try parseMatcherConfig(arena.allocator(), parsed.value);
         switch (config) {
-            .exact_match, .includes, .json_fields, .model_grade => {}, .tool_call => {},
+            .exact_match, .includes, .json_fields, .model_grade => {},
+            .tool_call => {},
         }
     }
 }
@@ -741,7 +793,7 @@ test "evaluate tool_call passes with matching tool name and args" {
     const expected_calls = [_]registry.ExpectedToolCall{
         .{
             .name = "search_web",
-            .arguments_json = "{\"query\":\"x\"}",
+            .arguments_json = "{\"query\":\"weather melbourne\"}",
         },
     };
 
@@ -757,6 +809,36 @@ test "evaluate tool_call passes with matching tool name and args" {
     );
 
     try std.testing.expect(outcome.passed);
+}
+
+test "evaluate tool_call fails for mismatched argument value" {
+    const actual_calls = [_]services.ToolCall{
+        .{
+            .name = "search_web",
+            .arguments_json = "{\"query\":\"weather melbourne\"}",
+        },
+    };
+
+    const expected_calls = [_]registry.ExpectedToolCall{
+        .{
+            .name = "search_web",
+            .arguments_json = "{\"query\":\"weather sydney\"}",
+        },
+    };
+
+    const outcome = try evaluate(
+        std.testing.allocator,
+        .{
+            .tool_call = .{},
+        },
+        "",
+        null,
+        actual_calls[0..],
+        expected_calls[0..],
+    );
+
+    try std.testing.expect(!outcome.passed);
+    try std.testing.expectEqualStrings("tool argument value mismatch", outcome.failure_reason.?);
 }
 
 test "evaluate tool_call fails for wrong tool name" {

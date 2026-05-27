@@ -15,6 +15,7 @@ models.
 - Load eval cases from JSONL datasets.
 - Evaluate exact-match, includes, and required JSON field checks.
 - Evaluate model-graded checks through a configured LLM judge service.
+- Validate single-turn OpenAI-compatible tool calls and root-level arguments.
 - Call an OpenAI-compatible `POST /v1/chat/completions` endpoint.
 - Support authenticated and unauthenticated product endpoints.
 - Run grouped eval definitions across configured services and datasets.
@@ -64,6 +65,12 @@ Run a model-graded eval with the configured judge service:
 
 ```sh
 zig build run -- run --registry examples/registry --service local-product --eval quality.helpful_summary --judge-service judge
+```
+
+Run a single-turn tool-calling eval:
+
+```sh
+zig build run -- run --registry examples/registry --service local-product --eval tools.search_web
 ```
 
 `run` requires the selected service endpoint to be reachable.
@@ -151,6 +158,7 @@ It includes:
 - one smoke eval using `exact_match`
 - one structured-output eval using `json_fields`
 - one quality eval using `model_grade`
+- one tool eval using `tool_call`
 
 ## Model-Graded Evals
 
@@ -163,6 +171,15 @@ Model-graded evals are useful for quality checks such as helpfulness,
 correctness, completeness, summarization quality, or instruction following.
 They are more flexible than deterministic matchers, but they cost an extra
 model call and depend on the quality of the judge rubric.
+
+## Tool-Calling Evals
+
+Use `tool_call` to check whether a product chooses the expected OpenAI-style
+tool and sends the expected root-level argument values. Eval definitions provide
+the tool schema, and dataset cases provide expected tool calls.
+
+V3 validates tool selection and arguments only. It does not execute tools,
+simulate tool results, or run a multi-turn agent loop.
 
 ## Retry policy
 
@@ -186,6 +203,7 @@ The v1 focus is a small, stable core:
 - Product-neutral service configuration.
 - Capability-based eval grouping.
 - Deterministic matchers plus V2 model-graded judging.
+- V3 single-turn tool-call validation.
 - Clear ownership of allocated data in public APIs.
 
 ## Resources

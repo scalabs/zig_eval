@@ -1,8 +1,9 @@
 # Running Product Evals With `zig_eval`
 
-`zig_eval` is a registry-driven eval tool and library. V1 supports deterministic
-matchers, OpenAI-compatible chat-completions services, CLI execution, and text
-or JSON report output.
+`zig_eval` is a registry-driven eval tool and library. It supports
+deterministic matchers, model-graded checks, single-turn tool-calling evals,
+OpenAI-compatible chat-completions services, CLI execution, and text or JSON
+report output.
 
 ## Flow
 
@@ -135,7 +136,45 @@ Use `service_allowlist` to keep the eval targeted at product services. The
 judge service can still be used for grading even when it is not in the
 allowlist.
 
-## 5. Run From The CLI
+## 5. Configure Tool-Calling Evals
+
+Use `tool_call` to validate that a product selects the expected OpenAI-style
+tool and sends the expected root-level argument values. The eval definition
+provides tool schemas:
+
+```json
+{
+  "id": "tools.search_web",
+  "group": "tools",
+  "description": "Checks that the product chooses the search_web tool.",
+  "dataset_path": "data/tools/search_web/test.jsonl",
+  "split": "test",
+  "tools": [
+    {
+      "name": "search_web",
+      "description": "Search the web for current information.",
+      "parameters_json": "{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"}},\"required\":[\"query\"]}"
+    }
+  ],
+  "matcher": {
+    "kind": "tool_call"
+  },
+  "default_run_count": 1,
+  "service_allowlist": ["local-product"]
+}
+```
+
+Dataset cases provide the expected tool calls:
+
+```jsonl
+{"id":"case-1","input":"Search the web for the weather in Melbourne.","expected_tool_calls":[{"name":"search_web","arguments_json":"{\"query\":\"weather melbourne\"}"}]}
+```
+
+Extra actual tool calls and extra actual argument fields are allowed, but every
+expected tool call must be present and every expected root-level argument value
+must match exactly.
+
+## 6. Run From The CLI
 
 List services and evals:
 
@@ -159,6 +198,12 @@ Run a model-graded eval with a specific judge service:
 
 ```sh
 zig build run -- run --registry examples/registry --service local-product --eval quality.helpful_summary --judge-service judge
+```
+
+Run a tool-calling eval:
+
+```sh
+zig build run -- run --registry examples/registry --service local-product --eval tools.search_web
 ```
 
 Run with bounded parallelism while limiting concurrent requests per service:
@@ -186,7 +231,7 @@ with OpenAI-style chat completions.
 Text output prints progress lines during parallel runs. JSON output suppresses
 progress so stdout remains machine-readable.
 
-## 6. Wire The Library From Zig
+## 7. Wire The Library From Zig
 
 The CLI is the easiest path, but library users can still call the same modules
 directly.
@@ -251,5 +296,7 @@ pub fn runProductEvals(allocator: std.mem.Allocator) !void {
 - Service calls must target an OpenAI-compatible chat-completions endpoint.
 - JSON field matching checks root-level fields only.
 - Model-graded evals require one extra judge model call per candidate output.
-- Streaming, tool-calling, multimodal evals, and advanced significance testing
-  are out of scope for v1.
+- Tool-calling evals validate tool selection and arguments only; tool execution
+  and multi-turn tool-result loops are not implemented.
+- Streaming, multimodal evals, and advanced significance testing are out of
+  scope for the current implementation.

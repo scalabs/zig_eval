@@ -330,18 +330,7 @@ fn collectEvalTasks(
                     try tasks.append(allocator, .{
                         .eval_definition = eval_definition,
                         .service = service,
-                        .case = .{
-                                   .id = try arena_allocator.dupe(u8, case.id),
-                                   .input = try arena_allocator.dupe(u8, case.input),
-                                   .ideal = if (case.ideal) |ideal|
-                                        try arena_allocator.dupe(u8, ideal)
-                                    else
-                                        null,
-                                    .expected_tool_calls = if (case.expected_tool_calls) |calls|
-                                        try arena_allocator.dupe(registry.ExpectedToolCall, calls)
-                                    else
-                                        null,
-                                },
+                        .case = try copyEvalCaseForTask(arena_allocator, case),
                         .run_index = run_index,
                     });
                 }
@@ -350,6 +339,36 @@ fn collectEvalTasks(
     }
 
     return tasks;
+}
+
+fn copyEvalCaseForTask(
+    allocator: std.mem.Allocator,
+    case: registry.EvalCase,
+) !registry.EvalCase {
+    return .{
+        .id = try allocator.dupe(u8, case.id),
+        .input = try allocator.dupe(u8, case.input),
+        .ideal = if (case.ideal) |ideal| try allocator.dupe(u8, ideal) else null,
+        .expected_tool_calls = try copyExpectedToolCalls(allocator, case.expected_tool_calls),
+    };
+}
+
+fn copyExpectedToolCalls(
+    allocator: std.mem.Allocator,
+    expected_tool_calls: ?[]const registry.ExpectedToolCall,
+) !?[]const registry.ExpectedToolCall {
+    const calls = expected_tool_calls orelse return null;
+    const copied = try allocator.alloc(registry.ExpectedToolCall, calls.len);
+    for (calls, copied) |call, *target| {
+        target.* = .{
+            .name = try allocator.dupe(u8, call.name),
+            .arguments_json = if (call.arguments_json) |arguments_json|
+                try allocator.dupe(u8, arguments_json)
+            else
+                null,
+        };
+    }
+    return copied;
 }
 
 fn runOneCase(
@@ -363,9 +382,9 @@ fn runOneCase(
     case: registry.EvalCase,
     run_index: u32,
 ) !void {
-    const input = services.ChatCallInput{ 
-       .prompt = case.input,
-       .tools = eval_definition.tools, 
+    const input = services.ChatCallInput{
+        .prompt = case.input,
+        .tools = eval_definition.tools,
     };
     const started_at = std.time.milliTimestamp();
 
@@ -439,12 +458,12 @@ fn evaluateRunMatcher(
     return switch (matcher) {
         .model_grade => |config| evaluateModelGradeMatcher(allocator, options, config, input, output, ideal),
         else => options.matcher_evaluator(
-           allocator,
-           matcher,
-           output,
-           ideal,
-           tool_calls,
-           expected_tool_calls,
+            allocator,
+            matcher,
+            output,
+            ideal,
+            tool_calls,
+            expected_tool_calls,
         ),
     };
 }
@@ -933,6 +952,51 @@ test "RunResult stores retry metadata" {
     try std.testing.expect(result.retried);
 }
 
+test "runEvaluations runs tool_call evals with loaded expected calls" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{
+        .sub_path = "tool_cases.jsonl",
+        .data = "{\"id\":\"case-1\",\"input\":\"Search weather\",\"expected_tool_calls\":[{\"name\":\"search_web\",\"arguments_json\":\"{\\\"query\\\":\\\"weather melbourne\\\"}\"}]}\n",
+    });
+
+    const allowlist = [_][]const u8{"product"};
+    const tools = [_]registry.ToolDefinition{
+        .{
+            .name = "search_web",
+            .description = "Search the web",
+            .parameters_json = "{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"}}}",
+        },
+    };
+    const evals = [_]registry.EvalDefinition{
+        .{
+            .id = "tools.search_web",
+            .group = "tools",
+            .description = "tool eval",
+            .dataset_path = "tool_cases.jsonl",
+            .split = "test",
+            .matcher = .{ .tool_call = .{} },
+            .default_run_count = 1,
+            .service_allowlist = allowlist[0..],
+            .tools = tools[0..],
+        },
+    };
+    const configured_services = [_]services.ServiceConfig{serviceConfig("product")};
+
+    var result = try runEvaluations(std.testing.allocator, .{
+        .root_dir = tmp.dir,
+        .services = configured_services[0..],
+        .evals = evals[0..],
+        .service_caller = fakeToolServiceCaller,
+        .matcher_evaluator = evaluateMatcherForRunner,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.runs.len);
+    try std.testing.expect(result.runs[0].passed);
+    try std.testing.expectEqualStrings("tools.search_web", result.runs[0].eval_id);
+}
+
 fn evalDefinition(
     id: []const u8,
     dataset_path: []const u8,
@@ -1099,6 +1163,52 @@ fn fakeFailingJudgeServiceCaller(
         .content = try allocator.dupe(u8, "candidate answer"),
         .model = try allocator.dupe(u8, service.default_model),
         .status_code = 200,
+    };
+}
+
+fn fakeToolServiceCaller(
+    allocator: std.mem.Allocator,
+    service: services.ServiceConfig,
+    input: services.ChatCallInput,
+) anyerror!services.ChatCallOutput {
+    if (input.tools == null or input.tools.?.len != 1) {
+        return error.ExpectedToolSchemas;
+    }
+
+    const calls = try allocator.alloc(services.ToolCall, 1);
+    calls[0] = .{
+        .name = try allocator.dupe(u8, "search_web"),
+        .arguments_json = try allocator.dupe(u8, "{\"query\":\"weather melbourne\"}"),
+    };
+
+    return .{
+        .content = try allocator.dupe(u8, ""),
+        .model = try allocator.dupe(u8, service.default_model),
+        .status_code = 200,
+        .tool_calls = calls,
+    };
+}
+
+fn evaluateMatcherForRunner(
+    allocator: std.mem.Allocator,
+    matcher: matchers.MatcherConfig,
+    output: []const u8,
+    ideal: ?[]const u8,
+    tool_calls: ?[]const services.ToolCall,
+    expected_tool_calls: ?[]const registry.ExpectedToolCall,
+) anyerror!MatcherOutcome {
+    const outcome = try matchers.evaluate(
+        allocator,
+        matcher,
+        output,
+        ideal,
+        tool_calls,
+        expected_tool_calls,
+    );
+    return .{
+        .passed = outcome.passed,
+        .score = outcome.score,
+        .failure_reason = outcome.failure_reason,
     };
 }
 

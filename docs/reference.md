@@ -70,6 +70,7 @@ Each eval definition describes one eval and points to one JSONL dataset.
 | `matcher` | yes | Matcher configuration parsed by `matchers.parseMatcherConfig`. |
 | `default_run_count` | yes | Number of times each case should run by default. |
 | `service_allowlist` | no | Service names allowed for this eval. |
+| `tools` | no | OpenAI-compatible function tool schemas used by `tool_call` evals. |
 
 Supported matcher config kinds:
 
@@ -84,6 +85,8 @@ Supported matcher config kinds:
   input, candidate output, optional `ideal`, and the rubric. The runner calls
   the judge service and converts the judge JSON into a score and pass/fail
   result. CLI users can override `judge_service` with `--judge-service`.
+- `tool_call`: validates that an OpenAI-style response contains the expected
+  tool name and expected root-level argument values.
 
 Example model-graded matcher:
 
@@ -115,6 +118,33 @@ For model-graded evals, `service_allowlist` should usually list only product
 services. The judge service is selected by `matcher.judge_service` or
 `--judge-service` and does not need to be in the allowlist.
 
+Example tool-calling eval:
+
+```json
+{
+  "id": "tools.search_web",
+  "group": "tools",
+  "description": "Checks that the product chooses the search_web tool.",
+  "dataset_path": "data/tools/search_web/test.jsonl",
+  "split": "test",
+  "tools": [
+    {
+      "name": "search_web",
+      "description": "Search the web for current information.",
+      "parameters_json": "{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"}},\"required\":[\"query\"]}"
+    }
+  ],
+  "matcher": {
+    "kind": "tool_call"
+  },
+  "default_run_count": 1,
+  "service_allowlist": ["local-product"]
+}
+```
+
+`parameters_json` must parse as a JSON object. `tool_call` does not execute the
+tool or run a multi-turn loop.
+
 ## Dataset Case
 
 Datasets are newline-delimited JSON. Each non-empty line is one case.
@@ -124,12 +154,23 @@ Datasets are newline-delimited JSON. Each non-empty line is one case.
 | `id` | yes | Stable case id used in run results. |
 | `input` | yes | Prompt sent to the service as the user message. |
 | `ideal` | no | Expected value used by matcher implementations. |
+| `expected_tool_calls` | no | Expected OpenAI-style tool call names and optional root-level argument values. |
 
 Example:
 
 ```jsonl
 {"id":"case-1","input":"Reply with exactly OK.","ideal":"OK"}
 ```
+
+Tool-calling case example:
+
+```jsonl
+{"id":"case-1","input":"Search the web for the weather in Melbourne.","expected_tool_calls":[{"name":"search_web","arguments_json":"{\"query\":\"weather melbourne\"}"}]}
+```
+
+For `expected_tool_calls[*].arguments_json`, every expected root-level field
+must exist in the actual tool arguments and have the same JSON value. Extra
+actual argument fields are allowed.
 
 ## Runner Output
 

@@ -288,14 +288,32 @@ fn parseOptionalTools(
             else => return error.InvalidEvalDefinition,
         };
 
+        const parameters_json = try dupRequiredString(allocator, tool_object, "parameters_json");
+        try validateToolParametersJson(allocator, parameters_json);
+
         try items.append(allocator, .{
             .name = try dupRequiredString(allocator, tool_object, "name"),
             .description = try dupRequiredString(allocator, tool_object, "description"),
-            .parameters_json = try dupRequiredString(allocator, tool_object, "parameters_json"),
+            .parameters_json = parameters_json,
         });
     }
 
     return try allocator.dupe(ToolDefinition, items.items);
+}
+
+fn validateToolParametersJson(
+    allocator: std.mem.Allocator,
+    parameters_json: []const u8,
+) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, parameters_json, .{}) catch {
+        return error.InvalidEvalDefinition;
+    };
+    defer parsed.deinit();
+
+    switch (parsed.value) {
+        .object => {},
+        else => return error.InvalidEvalDefinition,
+    }
 }
 
 fn parseOptionalExpectedToolCalls(
@@ -735,6 +753,84 @@ test "parseEvalDefinition supports tool definitions" {
     try std.testing.expectEqualStrings("search_web", tools[0].name);
 }
 
+test "parseEvalDefinition rejects malformed tool parameters json" {
+    const json =
+        \\{
+        \\  "id": "tools.search_web",
+        \\  "group": "tools",
+        \\  "description": "tool eval",
+        \\  "dataset_path": "data/tools/search_web/test.jsonl",
+        \\  "split": "test",
+        \\  "tools": [
+        \\    {
+        \\      "name": "search_web",
+        \\      "description": "Search the web",
+        \\      "parameters_json": "{invalid json}"
+        \\    }
+        \\  ],
+        \\  "matcher": {
+        \\    "kind": "tool_call"
+        \\  },
+        \\  "default_run_count": 1
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parsed_json = try std.json.parseFromSlice(
+        std.json.Value,
+        arena.allocator(),
+        json,
+        .{},
+    );
+    defer parsed_json.deinit();
+
+    try std.testing.expectError(
+        error.InvalidEvalDefinition,
+        parseEvalDefinition(arena.allocator(), parsed_json.value),
+    );
+}
+
+test "parseEvalDefinition rejects non-object tool parameters json" {
+    const json =
+        \\{
+        \\  "id": "tools.search_web",
+        \\  "group": "tools",
+        \\  "description": "tool eval",
+        \\  "dataset_path": "data/tools/search_web/test.jsonl",
+        \\  "split": "test",
+        \\  "tools": [
+        \\    {
+        \\      "name": "search_web",
+        \\      "description": "Search the web",
+        \\      "parameters_json": "[]"
+        \\    }
+        \\  ],
+        \\  "matcher": {
+        \\    "kind": "tool_call"
+        \\  },
+        \\  "default_run_count": 1
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parsed_json = try std.json.parseFromSlice(
+        std.json.Value,
+        arena.allocator(),
+        json,
+        .{},
+    );
+    defer parsed_json.deinit();
+
+    try std.testing.expectError(
+        error.InvalidEvalDefinition,
+        parseEvalDefinition(arena.allocator(), parsed_json.value),
+    );
+}
+
 test "parseEvalCase supports expected tool calls" {
     const json =
         \\{
@@ -771,4 +867,4 @@ test "parseEvalCase supports expected tool calls" {
 
     try std.testing.expectEqual(@as(usize, 1), calls.len);
     try std.testing.expectEqualStrings("search_web", calls[0].name);
-}    
+}

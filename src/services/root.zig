@@ -44,6 +44,7 @@ pub const ToolCall = struct {
     arguments_json: []const u8,
 };
 
+/// `callChatCompletion` returns owned buffers; `deinit` releases them.
 pub const ChatCallOutput = struct {
     content: []u8,
     model: []u8,
@@ -55,6 +56,9 @@ pub const ChatCallOutput = struct {
     pub fn deinit(self: *ChatCallOutput, allocator: std.mem.Allocator) void {
         allocator.free(self.content);
         allocator.free(self.model);
+        if (self.tool_calls) |calls| {
+            freeToolCalls(allocator, calls);
+        }
         self.* = undefined;
     }
 };
@@ -330,38 +334,38 @@ fn renderChatPayloadJsonAlloc(
     try json_writer.endArray();
 
     if (tools) |tool_list| {
-       try json_writer.objectField("tools");
-       try json_writer.beginArray();
+        try json_writer.objectField("tools");
+        try json_writer.beginArray();
 
-       for (tool_list) |tool| {
-          try json_writer.beginObject();
+        for (tool_list) |tool| {
+            try json_writer.beginObject();
 
-          try json_writer.objectField("type");
-          try json_writer.write("function");
+            try json_writer.objectField("type");
+            try json_writer.write("function");
 
-          try json_writer.objectField("function");
-          try json_writer.beginObject();
+            try json_writer.objectField("function");
+            try json_writer.beginObject();
 
-          try json_writer.objectField("name");
-          try json_writer.write(tool.name);
+            try json_writer.objectField("name");
+            try json_writer.write(tool.name);
 
-          try json_writer.objectField("description");
-          try json_writer.write(tool.description);
+            try json_writer.objectField("description");
+            try json_writer.write(tool.description);
 
-          try json_writer.objectField("parameters");
+            try json_writer.objectField("parameters");
 
-          var parsed = try std.json.parseFromSlice(
-            std.json.Value,
-            allocator,
-            tool.parameters_json,
-            .{},
-          );
-          defer parsed.deinit();
+            var parsed = try std.json.parseFromSlice(
+                std.json.Value,
+                allocator,
+                tool.parameters_json,
+                .{},
+            );
+            defer parsed.deinit();
 
-          try json_writer.write(parsed.value);
+            try json_writer.write(parsed.value);
 
-          try json_writer.endObject();
-          try json_writer.endObject();
+            try json_writer.endObject();
+            try json_writer.endObject();
         }
 
         try json_writer.endArray();
@@ -408,6 +412,7 @@ fn parseToolCalls(
 
     var items = std.ArrayList(ToolCall){};
     defer items.deinit(allocator);
+    errdefer freeToolCallItems(allocator, items.items);
 
     for (tool_calls_array) |entry| {
         const entry_object = switch (entry) {
@@ -424,15 +429,13 @@ fn parseToolCalls(
         };
 
         const name = switch (function_object.get("name") orelse
-            return error.MalformedSuccessPayload)
-        {
+            return error.MalformedSuccessPayload) {
             .string => |value| value,
             else => return error.MalformedSuccessPayload,
         };
 
         const arguments_json = switch (function_object.get("arguments") orelse
-            return error.MalformedSuccessPayload)
-        {
+            return error.MalformedSuccessPayload) {
             .string => |value| value,
             else => return error.MalformedSuccessPayload,
         };
@@ -444,6 +447,18 @@ fn parseToolCalls(
     }
 
     return try allocator.dupe(ToolCall, items.items);
+}
+
+fn freeToolCalls(allocator: std.mem.Allocator, calls: []const ToolCall) void {
+    freeToolCallItems(allocator, calls);
+    allocator.free(calls);
+}
+
+fn freeToolCallItems(allocator: std.mem.Allocator, calls: []const ToolCall) void {
+    for (calls) |call| {
+        allocator.free(call.name);
+        allocator.free(call.arguments_json);
+    }
 }
 
 fn parseChatCompletionResponse(
@@ -493,21 +508,27 @@ fn parseChatCompletionResponse(
     };
 
     const tool_calls = try parseToolCalls(allocator, message_object);
+    errdefer if (tool_calls) |calls| freeToolCalls(allocator, calls);
 
     const content = if (message_object.get("content")) |content_value|
-       switch (content_value) {
-          .string => |value| value,
-          .null => "",
-          else => return error.MalformedSuccessPayload,
+        switch (content_value) {
+            .string => |value| value,
+            .null => "",
+            else => return error.MalformedSuccessPayload,
         }
     else if (tool_calls != null)
         ""
     else
-       return error.MalformedSuccessPayload;
+        return error.MalformedSuccessPayload;
+
+    const owned_content = try allocator.dupe(u8, content);
+    errdefer allocator.free(owned_content);
+
+    const owned_model = try allocator.dupe(u8, model);
 
     return .{
-        .content = try allocator.dupe(u8, content),
-        .model = try allocator.dupe(u8, model),
+        .content = owned_content,
+        .model = owned_model,
         .status_code = @intFromEnum(status),
         .tool_calls = tool_calls,
     };
@@ -887,8 +908,7 @@ test "renderChatPayloadJsonAlloc includes tools" {
         .{
             .name = "search_web",
             .description = "Search the web",
-            .parameters_json =
-                "{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"}}}",
+            .parameters_json = "{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"}}}",
         },
     };
 
@@ -959,13 +979,6 @@ test "parseChatCompletionResponse parses tool calls" {
         "gpt-4.1-mini",
     );
     defer output.deinit(std.testing.allocator);
-    defer if (output.tool_calls) |calls| {
-       for (calls) |call| {
-           std.testing.allocator.free(call.name);
-           std.testing.allocator.free(call.arguments_json);
-        }
-        std.testing.allocator.free(calls);
-    };
 
     try std.testing.expect(output.tool_calls != null);
 
