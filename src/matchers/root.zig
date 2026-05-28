@@ -200,7 +200,8 @@ fn evaluateJsonFields(
     config: JsonFieldsMatcherConfig,
     output: []const u8,
 ) !MatchOutcome {
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, output, .{}) catch {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, output, .{}) catch |err| {
+        if (err == error.OutOfMemory) return err;
         return failed("invalid json output");
     };
     defer parsed.deinit();
@@ -229,49 +230,94 @@ fn evaluateToolCalls(
         return failed("missing tool call");
     if (actual.len == 0) return failed("missing tool call");
 
-    var used_actual = try allocator.alloc(bool, actual.len);
+    const used_actual = try allocator.alloc(bool, actual.len);
     defer allocator.free(used_actual);
     @memset(used_actual, false);
 
-    for (expected) |expected_call| {
-        var saw_matching_name = false;
-        var argument_failure: ?[]const u8 = null;
-
-        for (actual, 0..) |actual_call, actual_index| {
-            if (used_actual[actual_index]) continue;
-            if (!std.mem.eql(u8, expected_call.name, actual_call.name)) {
-                continue;
-            }
-
-            saw_matching_name = true;
-
-            if (expected_call.arguments_json) |expected_args| {
-                const argument_outcome = try evaluateToolCallArguments(
-                    allocator,
-                    actual_call.arguments_json,
-                    expected_args,
-                );
-                if (argument_outcome.passed) {
-                    argument_failure = null;
-                    used_actual[actual_index] = true;
-                    break;
-                }
-                argument_failure = argument_outcome.failure_reason;
-                continue;
-            }
-
-            argument_failure = null;
-            used_actual[actual_index] = true;
-            break;
-        }
-
-        if (!saw_matching_name) {
-            return failed("wrong tool name");
-        }
-        if (argument_failure) |reason| return failed(reason);
+    var failure = ToolCallSearchFailure{};
+    if (try matchExpectedToolCallAt(allocator, expected, actual, used_actual, 0, &failure)) {
+        return passed();
     }
 
-    return passed();
+    if (!failure.saw_matching_name) return failed("wrong tool name");
+    if (failure.argument_failure) |reason| return failed(reason);
+    return failed("wrong tool name");
+}
+
+const ToolCallSearchFailure = struct {
+    saw_matching_name: bool = false,
+    argument_failure: ?[]const u8 = null,
+};
+
+fn matchExpectedToolCallAt(
+    allocator: std.mem.Allocator,
+    expected: []const registry.ExpectedToolCall,
+    actual: []const services.ToolCall,
+    used_actual: []bool,
+    expected_index: usize,
+    failure: *ToolCallSearchFailure,
+) !bool {
+    if (expected_index >= expected.len) return true;
+
+    const expected_call = expected[expected_index];
+
+    for (actual, 0..) |actual_call, actual_index| {
+        if (used_actual[actual_index]) continue;
+        if (!std.mem.eql(u8, expected_call.name, actual_call.name)) continue;
+
+        failure.saw_matching_name = true;
+
+        if (expected_call.arguments_json) |expected_args| {
+            const argument_outcome = try evaluateToolCallArguments(
+                allocator,
+                actual_call.arguments_json,
+                expected_args,
+            );
+            if (!argument_outcome.passed) {
+                rememberArgumentFailure(failure, argument_outcome.failure_reason);
+                continue;
+            }
+        }
+
+        used_actual[actual_index] = true;
+        if (try matchExpectedToolCallAt(
+            allocator,
+            expected,
+            actual,
+            used_actual,
+            expected_index + 1,
+            failure,
+        )) {
+            return true;
+        }
+        used_actual[actual_index] = false;
+    }
+
+    return false;
+}
+
+fn rememberArgumentFailure(
+    failure: *ToolCallSearchFailure,
+    reason: ?[]const u8,
+) void {
+    const new_reason = reason orelse return;
+    const current = failure.argument_failure orelse {
+        failure.argument_failure = new_reason;
+        return;
+    };
+    if (argumentFailureRank(new_reason) > argumentFailureRank(current)) {
+        failure.argument_failure = new_reason;
+    }
+}
+
+fn argumentFailureRank(reason: []const u8) u8 {
+    if (std.mem.eql(u8, reason, "invalid expected arguments json")) return 5;
+    if (std.mem.eql(u8, reason, "invalid arguments json")) return 4;
+    if (std.mem.eql(u8, reason, "arguments json is not object")) return 4;
+    if (std.mem.eql(u8, reason, "expected arguments json is not object")) return 4;
+    if (std.mem.eql(u8, reason, "missing expected argument field")) return 3;
+    if (std.mem.eql(u8, reason, "tool argument value mismatch")) return 2;
+    return 1;
 }
 
 fn evaluateToolCallArguments(
@@ -284,7 +330,8 @@ fn evaluateToolCallArguments(
         allocator,
         actual_json,
         .{},
-    ) catch {
+    ) catch |err| {
+        if (err == error.OutOfMemory) return err;
         return failed("invalid arguments json");
     };
     defer parsed.deinit();
@@ -299,7 +346,8 @@ fn evaluateToolCallArguments(
         allocator,
         expected_json,
         .{},
-    ) catch {
+    ) catch |err| {
+        if (err == error.OutOfMemory) return err;
         return failed("invalid expected arguments json");
     };
     defer expected_parsed.deinit();
@@ -906,6 +954,42 @@ test "evaluate tool_call checks later same-name calls for matching args" {
     try std.testing.expect(outcome.passed);
 }
 
+test "evaluate tool_call backtracks broad expectations to satisfy later args" {
+    const actual_calls = [_]services.ToolCall{
+        .{
+            .name = "search_web",
+            .arguments_json = "{\"location\":\"melbourne\"}",
+        },
+        .{
+            .name = "search_web",
+            .arguments_json = "{\"query\":\"weather\"}",
+        },
+    };
+
+    const expected_calls = [_]registry.ExpectedToolCall{
+        .{
+            .name = "search_web",
+        },
+        .{
+            .name = "search_web",
+            .arguments_json = "{\"location\":\"melbourne\"}",
+        },
+    };
+
+    const outcome = try evaluate(
+        std.testing.allocator,
+        .{
+            .tool_call = .{},
+        },
+        "",
+        null,
+        actual_calls[0..],
+        expected_calls[0..],
+    );
+
+    try std.testing.expect(outcome.passed);
+}
+
 test "evaluate tool_call fails for empty actual calls" {
     const actual_calls = [_]services.ToolCall{};
     const expected_calls = [_]registry.ExpectedToolCall{
@@ -1048,4 +1132,36 @@ test "evaluate tool_call fails for missing expected argument field" {
     );
 
     try std.testing.expect(!outcome.passed);
+}
+
+test "evaluate json_fields propagates out of memory" {
+    var failing_allocator = std.testing.FailingAllocator.init(
+        std.testing.allocator,
+        .{ .fail_index = 0 },
+    );
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        evaluateJsonFields(
+            failing_allocator.allocator(),
+            .{ .required_fields = &.{"ok"} },
+            "{\"ok\":true}",
+        ),
+    );
+}
+
+test "evaluate tool call arguments propagates out of memory" {
+    var failing_allocator = std.testing.FailingAllocator.init(
+        std.testing.allocator,
+        .{ .fail_index = 0 },
+    );
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        evaluateToolCallArguments(
+            failing_allocator.allocator(),
+            "{\"query\":\"weather\"}",
+            "{\"query\":\"weather\"}",
+        ),
+    );
 }

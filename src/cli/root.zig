@@ -93,11 +93,20 @@ pub fn parseArgs(args: []const []const u8) !CliOptions {
         } else if (std.mem.eql(u8, arg, "--judge-service")) {
             options.judge_service_override = try nextValue(args, &index);
         } else if (std.mem.eql(u8, arg, "--runs")) {
-            options.run_count_override = try parsePositiveU32(try nextValue(args, &index));
+            options.run_count_override = try parseBoundedPositiveU32(
+                try nextValue(args, &index),
+                runner.max_run_count,
+            );
         } else if (std.mem.eql(u8, arg, "--parallel")) {
-            options.parallelism = try parsePositiveU32(try nextValue(args, &index));
+            options.parallelism = try parseBoundedPositiveU32(
+                try nextValue(args, &index),
+                runner.max_parallelism,
+            );
         } else if (std.mem.eql(u8, arg, "--max-inflight-per-service")) {
-            options.max_inflight_per_service = try parsePositiveU32(try nextValue(args, &index));
+            options.max_inflight_per_service = try parseBoundedPositiveU32(
+                try nextValue(args, &index),
+                runner.max_inflight_per_service,
+            );
         } else if (std.mem.eql(u8, arg, "--format")) {
             options.format = try parseFormat(try nextValue(args, &index));
         } else {
@@ -163,6 +172,8 @@ fn runRegistryEvals(
     });
     defer run_result.deinit();
 
+    if (run_result.runs.len == 0) return error.NoEvalRunsMatched;
+
     var reports = try reporting.aggregateRunResults(allocator, run_result.runs);
     defer reports.deinit();
 
@@ -215,9 +226,10 @@ fn parseFormat(value: []const u8) !OutputFormat {
     return error.InvalidArguments;
 }
 
-fn parsePositiveU32(value: []const u8) !u32 {
+fn parseBoundedPositiveU32(value: []const u8, max_value: u32) !u32 {
     const parsed = std.fmt.parseInt(u32, value, 10) catch return error.InvalidArguments;
     if (parsed == 0) return error.InvalidArguments;
+    if (parsed > max_value) return error.InvalidArguments;
     return parsed;
 }
 
@@ -273,9 +285,35 @@ test "parseArgs rejects invalid args" {
     try std.testing.expectError(error.InvalidArguments, parseArgs(&.{}));
     try std.testing.expectError(error.InvalidArguments, parseArgs(&.{"unknown"}));
     try std.testing.expectError(error.InvalidArguments, parseArgs(&.{ "run", "--runs", "0" }));
+    try std.testing.expectError(error.InvalidArguments, parseArgs(&.{ "run", "--runs", "10001" }));
+    try std.testing.expectError(error.InvalidArguments, parseArgs(&.{ "run", "--parallel", "257" }));
+    try std.testing.expectError(error.InvalidArguments, parseArgs(&.{ "run", "--max-inflight-per-service", "257" }));
     try std.testing.expectError(error.InvalidArguments, parseArgs(&.{ "run", "--format", "xml" }));
     try std.testing.expectError(error.InvalidArguments, parseArgs(&.{ "run", "--service" }));
     try std.testing.expectError(error.InvalidArguments, parseArgs(&.{ "run", "--judge-service" }));
+}
+
+test "runWithDependencies fails when filters match no eval runs" {
+    var out = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer out.deinit();
+
+    try std.testing.expectError(
+        error.NoEvalRunsMatched,
+        runWithDependencies(
+            std.testing.allocator,
+            &.{
+                "run",
+                "--registry",
+                "examples/registry",
+                "--service",
+                "missing-service",
+                "--format",
+                "json",
+            },
+            &out.writer,
+            .{ .service_caller = fakeServiceCaller },
+        ),
+    );
 }
 
 test "runWithDependencies lists example registry" {

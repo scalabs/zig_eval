@@ -205,11 +205,13 @@ Important fields:
 - `run_index`
 - `output`
 - `passed`, `score`, `failure_reason`
-- `attempt_count`, `retried`
+- `status_code`, `attempt_count`, `retried`
+- `judge_attempt_count`, `judge_retried`, `judge_status_code` for model-graded evals
 - `latency_ms`
 
 Service call failures are converted into failed run results with
-`failure_reason` set to the error name.
+`failure_reason` set to the error name or upstream failure message. Retry
+attempts include candidate calls and model-grade judge calls.
 
 ## JSON Report Artifacts
 
@@ -230,8 +232,12 @@ Service call failures are converted into failed run results with
       "passed": true,
       "score": 1,
       "failure_reason": null,
+      "status_code": 200,
       "attempt_count": 1,
       "retried": false,
+      "judge_attempt_count": 0,
+      "judge_retried": false,
+      "judge_status_code": null,
       "latency_ms": 42
     }
   ]

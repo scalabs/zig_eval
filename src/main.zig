@@ -12,7 +12,16 @@ pub fn main() !void {
     const out = &stdout_writer.interface;
 
     zig_eval.cli.run(allocator, args[1..], out) catch |err| switch (err) {
-        error.InvalidArguments => try zig_eval.cli.writeUsage(out),
+        error.InvalidArguments => {
+            try zig_eval.cli.writeUsage(out);
+            try out.flush();
+            std.process.exit(2);
+        },
+        error.NoEvalRunsMatched => {
+            try out.writeAll("No eval runs matched the provided filters.\n");
+            try out.flush();
+            std.process.exit(1);
+        },
         else => return err,
     };
 

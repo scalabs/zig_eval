@@ -4,6 +4,8 @@ const registry = @import("../registry/root.zig");
 
 const max_file_bytes = 1024 * 1024;
 const max_response_bytes = 8 * 1024 * 1024;
+const max_retry_attempts = 10;
+const max_retry_backoff_ms = 60_000;
 
 pub const RetryConfig = struct {
     max_attempts: u32 = 1,
@@ -118,7 +120,8 @@ pub fn loadServices(
     const raw = try dir.readFileAlloc(allocator, path, max_file_bytes);
     defer allocator.free(raw);
 
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch |err| {
+        if (err == error.OutOfMemory) return err;
         return error.InvalidServicesJson;
     };
     defer parsed.deinit();
@@ -191,6 +194,7 @@ pub fn callChatCompletionResult(
     const system_prompt = selectSystemPrompt(service, input);
 
     const endpoint = normalizeChatCompletionsUrl(allocator, service.base_url) catch |err| {
+        if (err == error.OutOfMemory) return err;
         return try failureResultFromError(allocator, err, .invalid_request, null, 1, false, model_name);
     };
     defer allocator.free(endpoint);
@@ -208,6 +212,7 @@ pub fn callChatCompletionResult(
         input.attachment_dir,
         input.attachments,
     ) catch |err| {
+        if (err == error.OutOfMemory) return err;
         return try failureResultFromError(allocator, err, .invalid_request, null, 1, false, model_name);
     };
     defer allocator.free(payload);
@@ -217,6 +222,7 @@ pub fn callChatCompletionResult(
     try headers.append(allocator, .{ .name = "content-type", .value = "application/json" });
 
     const api_key = readApiKeyFromEnv(allocator, service.api_key_env) catch |err| {
+        if (err == error.OutOfMemory) return err;
         return try failureResultFromError(allocator, err, .invalid_request, null, 1, false, model_name);
     };
     defer if (api_key) |key| allocator.free(key);
@@ -247,6 +253,7 @@ pub fn callChatCompletionResult(
             &response_writer.writer,
             service.timeout_ms,
         ) catch |err| {
+            if (err == error.OutOfMemory) return err;
             if (attempt >= max_attempts) {
                 return try failureResultFromError(
                     allocator,
@@ -274,6 +281,7 @@ pub fn callChatCompletionResult(
             response_writer.written(),
             model_name,
         ) catch |err| {
+            if (err == error.OutOfMemory) return err;
             const reason = if (err == error.UpstreamHttpError)
                 try upstreamFailureReason(allocator, response_writer.written(), err)
             else
@@ -363,11 +371,11 @@ fn streamResponseWithLimit(
     while (true) {
         const remaining = max_bytes + 1 - bytes_read;
         const n = reader.stream(response_writer, .limited(remaining)) catch |err| switch (err) {
+            error.EndOfStream => break,
             else => |e| return e,
         };
         bytes_read += n;
         if (bytes_read > max_bytes) return error.ResponseTooLarge;
-        if (n == 0) break;
     }
 }
 
@@ -713,9 +721,10 @@ fn writeUserMessageObject(
     try writeTextContentBlock(json_writer, text_content);
 
     for (attachment_list) |attachment| {
-        const mime_type = try validatedAttachmentMimeType(attachment);
+        var resolved = try resolveAttachment(allocator, dir, attachment);
+        defer resolved.deinit(allocator);
         if (attachment.kind == .image) {
-            try writeImageContentBlock(json_writer, allocator, dir, attachment, mime_type);
+            try writeImageContentBlock(json_writer, allocator, resolved.real_path, resolved.mime_type);
         }
     }
 
@@ -735,19 +744,24 @@ fn buildTextContentWithAttachments(
     try out.writer.writeAll(prompt);
 
     for (attachments) |attachment| {
-        const mime_type = try validatedAttachmentMimeType(attachment);
+        var resolved = try resolveAttachment(allocator, dir, attachment);
+        defer resolved.deinit(allocator);
         if (attachment.kind == .image) {
             continue;
         }
 
-        const raw = try dir.readFileAlloc(allocator, attachment.path, registry.max_attachment_bytes);
+        const raw = try readResolvedFileAlloc(
+            allocator,
+            resolved.real_path,
+            registry.max_attachment_bytes,
+        );
         defer allocator.free(raw);
         if (!std.unicode.utf8ValidateSlice(raw)) return error.InvalidAttachmentText;
 
         const label = attachment.label orelse attachment.path;
         try out.writer.print(
             "\n\n[Attachment: {s} ({s})]\n```text\n{s}\n```",
-            .{ label, mime_type, raw },
+            .{ label, resolved.mime_type, raw },
         );
     }
 
@@ -769,11 +783,10 @@ fn writeTextContentBlock(
 fn writeImageContentBlock(
     json_writer: *std.json.Stringify,
     allocator: std.mem.Allocator,
-    dir: std.fs.Dir,
-    attachment: registry.Attachment,
+    real_path: []const u8,
     mime_type: []const u8,
 ) !void {
-    const data_url = try imageDataUrl(allocator, dir, attachment.path, mime_type);
+    const data_url = try imageDataUrl(allocator, real_path, mime_type);
     defer allocator.free(data_url);
 
     try json_writer.beginObject();
@@ -789,11 +802,10 @@ fn writeImageContentBlock(
 
 fn imageDataUrl(
     allocator: std.mem.Allocator,
-    dir: std.fs.Dir,
-    path: []const u8,
+    real_path: []const u8,
     mime_type: []const u8,
 ) ![]u8 {
-    const raw = try dir.readFileAlloc(allocator, path, registry.max_attachment_bytes);
+    const raw = try readResolvedFileAlloc(allocator, real_path, registry.max_attachment_bytes);
     defer allocator.free(raw);
 
     const encoded = try allocator.alloc(u8, std.base64.standard.Encoder.calcSize(raw.len));
@@ -807,8 +819,24 @@ fn attachmentMimeType(attachment: registry.Attachment) ?[]const u8 {
     return attachment.mime_type orelse registry.inferAttachmentMimeType(attachment.path);
 }
 
-fn validatedAttachmentMimeType(attachment: registry.Attachment) ![]const u8 {
-    if (!isSafeRelativePath(attachment.path)) return error.InvalidAttachmentPath;
+const ResolvedAttachment = struct {
+    mime_type: []const u8,
+    real_path: []u8,
+
+    fn deinit(self: *ResolvedAttachment, allocator: std.mem.Allocator) void {
+        allocator.free(self.real_path);
+        self.* = undefined;
+    }
+};
+
+fn resolveAttachment(
+    allocator: std.mem.Allocator,
+    dir: std.fs.Dir,
+    attachment: registry.Attachment,
+) !ResolvedAttachment {
+    const real_path = try registry.attachmentRealPathAlloc(allocator, dir, attachment.path);
+    errdefer allocator.free(real_path);
+
     const mime_type = attachmentMimeType(attachment) orelse return error.UnsupportedAttachmentType;
     const image_mime = isImageMimeType(mime_type);
     switch (attachment.kind) {
@@ -818,19 +846,17 @@ fn validatedAttachmentMimeType(attachment: registry.Attachment) ![]const u8 {
             if (!isTextMimeType(mime_type)) return error.UnsupportedAttachmentType;
         },
     }
-    return mime_type;
+    return .{ .mime_type = mime_type, .real_path = real_path };
 }
 
-fn isSafeRelativePath(path: []const u8) bool {
-    if (std.fs.path.isAbsolute(path)) return false;
-    var parts = std.mem.splitAny(u8, path, "/\\");
-    while (parts.next()) |part| {
-        if (part.len == 0) return false;
-        if (std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) {
-            return false;
-        }
-    }
-    return true;
+fn readResolvedFileAlloc(
+    allocator: std.mem.Allocator,
+    real_path: []const u8,
+    max_bytes: usize,
+) ![]u8 {
+    var file = try std.fs.openFileAbsolute(real_path, .{});
+    defer file.close();
+    return try file.readToEndAlloc(allocator, max_bytes);
 }
 
 fn isImageMimeType(mime_type: []const u8) bool {
@@ -917,7 +943,8 @@ fn parseChatCompletionResponse(
         return error.UpstreamHttpError;
     }
 
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch |err| {
+        if (err == error.OutOfMemory) return err;
         return error.InvalidUpstreamJson;
     };
     defer parsed.deinit();
@@ -991,7 +1018,8 @@ fn extractUpstreamErrorMessage(
     allocator: std.mem.Allocator,
     raw: []const u8,
 ) !?[]u8 {
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch |err| {
+        if (err == error.OutOfMemory) return err;
         return null;
     };
     defer parsed.deinit();
@@ -1067,11 +1095,14 @@ fn parseOptionalRetryConfig(
         else => return error.InvalidServiceConfig,
     };
 
-    return .{
+    const config = RetryConfig{
         .max_attempts = try parseOptionalU32(retry_object, "max_attempts", 1, false),
         .backoff_ms = try parseOptionalU32(retry_object, "backoff_ms", 0, true),
         .retry_on_status = try parseOptionalStatusList(allocator, retry_object, "retry_on_status"),
     };
+    if (config.max_attempts > max_retry_attempts) return error.InvalidServiceConfig;
+    if (config.backoff_ms > max_retry_backoff_ms) return error.InvalidServiceConfig;
+    return config;
 }
 
 fn parseOptionalU32(
@@ -1254,6 +1285,52 @@ test "loadServices rejects duplicate service names" {
 
     try std.testing.expectError(
         error.DuplicateServiceName,
+        loadServices(std.testing.allocator, tmp.dir, "registry/services.json"),
+    );
+}
+
+test "loadServices rejects excessive retry settings" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("registry");
+    try tmp.dir.writeFile(.{
+        .sub_path = "registry/services.json",
+        .data =
+        \\[
+        \\  {
+        \\    "name": "product-api",
+        \\    "base_url": "http://127.0.0.1:9000/v1",
+        \\    "default_model": "model-a",
+        \\    "timeout_ms": 1000,
+        \\    "retry": { "max_attempts": 11, "backoff_ms": 0 }
+        \\  }
+        \\]
+        ,
+    });
+
+    try std.testing.expectError(
+        error.InvalidServiceConfig,
+        loadServices(std.testing.allocator, tmp.dir, "registry/services.json"),
+    );
+
+    try tmp.dir.writeFile(.{
+        .sub_path = "registry/services.json",
+        .data =
+        \\[
+        \\  {
+        \\    "name": "product-api",
+        \\    "base_url": "http://127.0.0.1:9000/v1",
+        \\    "default_model": "model-a",
+        \\    "timeout_ms": 1000,
+        \\    "retry": { "max_attempts": 1, "backoff_ms": 60001 }
+        \\  }
+        \\]
+        ,
+    });
+
+    try std.testing.expectError(
+        error.InvalidServiceConfig,
         loadServices(std.testing.allocator, tmp.dir, "registry/services.json"),
     );
 }
@@ -1645,6 +1722,84 @@ test "renderChatPayloadJsonAlloc rejects file attachments with image mime types"
     );
 }
 
+test "renderChatPayloadJsonAlloc rejects attachment symlink escaping root" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("registry/assets");
+    try tmp.dir.writeFile(.{
+        .sub_path = "secret.md",
+        .data = "secret",
+    });
+    var registry_dir = try tmp.dir.openDir("registry", .{});
+    defer registry_dir.close();
+
+    try registry_dir.symLink("../../secret.md", "assets/link.md", .{});
+
+    const attachments = [_]registry.Attachment{
+        .{
+            .kind = .file,
+            .path = "assets/link.md",
+            .mime_type = "text/markdown",
+        },
+    };
+
+    try std.testing.expectError(
+        error.InvalidAttachmentPath,
+        renderChatPayloadJsonAlloc(
+            std.testing.allocator,
+            "gpt-4.1-mini",
+            "Summarize the attachment.",
+            null,
+            null,
+            null,
+            registry_dir,
+            attachments[0..],
+        ),
+    );
+}
+
+test "renderChatPayloadJsonAlloc allows attachment symlink inside root" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("registry/assets");
+    try tmp.dir.writeFile(.{
+        .sub_path = "registry/assets/real.md",
+        .data = "public notes",
+    });
+    var registry_dir = try tmp.dir.openDir("registry", .{});
+    defer registry_dir.close();
+
+    try registry_dir.symLink("real.md", "assets/link.md", .{});
+
+    const attachments = [_]registry.Attachment{
+        .{
+            .kind = .file,
+            .path = "assets/link.md",
+            .mime_type = "text/markdown",
+        },
+    };
+
+    const payload = try renderChatPayloadJsonAlloc(
+        std.testing.allocator,
+        "gpt-4.1-mini",
+        "Summarize the attachment.",
+        null,
+        null,
+        null,
+        registry_dir,
+        attachments[0..],
+    );
+    defer std.testing.allocator.free(payload);
+
+    try std.testing.expect(std.mem.indexOf(u8, payload, "public notes") != null);
+}
+
 test "parseChatCompletionResponse parses tool calls" {
     const raw =
         \\{
@@ -1683,5 +1838,54 @@ test "parseChatCompletionResponse parses tool calls" {
     try std.testing.expectEqualStrings(
         "search_web",
         calls[0].name,
+    );
+}
+
+test "parseChatCompletionResponse propagates out of memory" {
+    const raw =
+        \\{
+        \\  "choices": [
+        \\    {
+        \\      "message": {
+        \\        "content": "ok"
+        \\      }
+        \\    }
+        \\  ]
+        \\}
+    ;
+
+    var failing_allocator = std.testing.FailingAllocator.init(
+        std.testing.allocator,
+        .{ .fail_index = 0 },
+    );
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        parseChatCompletionResponse(
+            failing_allocator.allocator(),
+            .ok,
+            raw,
+            "gpt-4.1-mini",
+        ),
+    );
+}
+
+test "extractUpstreamErrorMessage propagates out of memory" {
+    const raw =
+        \\{
+        \\  "error": {
+        \\    "message": "rate limited"
+        \\  }
+        \\}
+    ;
+
+    var failing_allocator = std.testing.FailingAllocator.init(
+        std.testing.allocator,
+        .{ .fail_index = 0 },
+    );
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        extractUpstreamErrorMessage(failing_allocator.allocator(), raw),
     );
 }

@@ -5,6 +5,10 @@ const services = @import("../services/root.zig");
 const Thread = std.Thread;
 const Mutex = Thread.Mutex;
 
+pub const max_run_count = 10_000;
+pub const max_parallelism = 256;
+pub const max_inflight_per_service = 256;
+
 pub const RunResult = struct {
     group: []const u8,
     eval_id: []const u8,
@@ -16,8 +20,12 @@ pub const RunResult = struct {
     passed: bool,
     score: f64,
     failure_reason: ?[]const u8 = null,
+    status_code: ?u16 = null,
     attempt_count: u32 = 1,
     retried: bool = false,
+    judge_attempt_count: u32 = 0,
+    judge_retried: bool = false,
+    judge_status_code: ?u16 = null,
     latency_ms: u64,
 };
 
@@ -26,6 +34,9 @@ pub const MatcherOutcome = struct {
     score: f64,
     failure_reason: ?[]const u8 = null,
     owned_failure_reason: ?[]u8 = null,
+    judge_attempt_count: u32 = 0,
+    judge_retried: bool = false,
+    judge_status_code: ?u16 = null,
 };
 
 pub const ServiceCaller = *const fn (
@@ -148,7 +159,11 @@ pub fn runEvaluations(
     options: RunnerOptions,
 ) !RunnerResult {
     if (options.parallelism == 0) return error.InvalidParallelism;
+    if (options.parallelism > max_parallelism) return error.InvalidParallelism;
     if (options.max_inflight_per_service == 0) return error.InvalidMaxInflightPerService;
+    if (options.max_inflight_per_service > max_inflight_per_service) {
+        return error.InvalidMaxInflightPerService;
+    }
 
     const arena = try allocator.create(std.heap.ArenaAllocator);
     arena.* = std.heap.ArenaAllocator.init(allocator);
@@ -291,6 +306,10 @@ fn workerLoop(context: *WorkerContext) void {
                     recordWorkerError(context, err);
                     return;
                 };
+                writer.flush() catch |err| {
+                    recordWorkerError(context, err);
+                    return;
+                };
             }
         }
     }
@@ -345,6 +364,7 @@ fn collectEvalTasks(
 
         const run_count = options.run_count_override orelse eval_definition.default_run_count;
         if (run_count == 0) return error.InvalidRunCount;
+        if (run_count > max_run_count) return error.InvalidRunCount;
 
         var cases = try registry.loadEvalCases(
             allocator,
@@ -447,6 +467,7 @@ fn runOneCase(
     const started_at = std.time.milliTimestamp();
 
     var call_result = options.service_caller(temp_allocator, service, input) catch |err| {
+        if (err == error.OutOfMemory) return err;
         runs_mutex.lock();
         defer runs_mutex.unlock();
 
@@ -484,6 +505,7 @@ fn runOneCase(
                 .passed = false,
                 .score = 0.0,
                 .failure_reason = failure.reason,
+                .status_code = failure.status_code,
                 .attempt_count = failure.attempt_count,
                 .retried = failure.retried,
                 .latency_ms = elapsedMillis(started_at),
@@ -492,19 +514,24 @@ fn runOneCase(
         },
     };
 
-    const outcome = evaluateRunMatcher(
-        temp_allocator,
-        options,
-        eval_definition.matcher,
-        case.input,
-        output.content,
-        case.ideal,
-        output.tool_calls,
-        case.expected_tool_calls,
-    ) catch |err| MatcherOutcome{
-        .passed = false,
-        .score = 0.0,
-        .failure_reason = @errorName(err),
+    const outcome = outcome: {
+        break :outcome evaluateRunMatcher(
+            temp_allocator,
+            options,
+            eval_definition.matcher,
+            case.input,
+            output.content,
+            case.ideal,
+            output.tool_calls,
+            case.expected_tool_calls,
+        ) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            break :outcome MatcherOutcome{
+                .passed = false,
+                .score = 0.0,
+                .failure_reason = @errorName(err),
+            };
+        };
     };
     defer if (outcome.owned_failure_reason) |reason| temp_allocator.free(reason);
 
@@ -522,8 +549,12 @@ fn runOneCase(
         .passed = outcome.passed,
         .score = outcome.score,
         .failure_reason = outcome.failure_reason,
-        .attempt_count = output.attempt_count,
-        .retried = output.retried,
+        .status_code = output.status_code,
+        .attempt_count = output.attempt_count + outcome.judge_attempt_count,
+        .retried = output.retried or outcome.judge_retried,
+        .judge_attempt_count = outcome.judge_attempt_count,
+        .judge_retried = outcome.judge_retried,
+        .judge_status_code = outcome.judge_status_code,
         .latency_ms = elapsedMillis(started_at),
     });
 }
@@ -586,11 +617,28 @@ fn evaluateModelGradeMatcher(
                 .score = 0.0,
                 .failure_reason = owned_reason,
                 .owned_failure_reason = owned_reason,
+                .judge_attempt_count = failure.attempt_count,
+                .judge_retried = failure.retried,
+                .judge_status_code = failure.status_code,
             };
         },
     };
 
-    return parseJudgeOutcome(allocator, judge_output.content, config.pass_score);
+    var outcome = parseJudgeOutcome(allocator, judge_output.content, config.pass_score) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return .{
+            .passed = false,
+            .score = 0.0,
+            .failure_reason = @errorName(err),
+            .judge_attempt_count = judge_output.attempt_count,
+            .judge_retried = judge_output.retried,
+            .judge_status_code = judge_output.status_code,
+        };
+    };
+    outcome.judge_attempt_count = judge_output.attempt_count;
+    outcome.judge_retried = judge_output.retried;
+    outcome.judge_status_code = judge_output.status_code;
+    return outcome;
 }
 
 fn parseJudgeOutcome(
@@ -598,7 +646,8 @@ fn parseJudgeOutcome(
     raw: []const u8,
     pass_score: f64,
 ) !MatcherOutcome {
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch |err| {
+        if (err == error.OutOfMemory) return err;
         return error.InvalidModelGradeJudgeOutput;
     };
     defer parsed.deinit();
@@ -657,8 +706,12 @@ fn appendRunResult(
         .passed = result.passed,
         .score = result.score,
         .failure_reason = if (result.failure_reason) |reason| try arena_allocator.dupe(u8, reason) else null,
+        .status_code = result.status_code,
         .attempt_count = result.attempt_count,
         .retried = result.retried,
+        .judge_attempt_count = result.judge_attempt_count,
+        .judge_retried = result.judge_retried,
+        .judge_status_code = result.judge_status_code,
         .latency_ms = result.latency_ms,
     });
 }
@@ -1044,6 +1097,23 @@ test "runEvaluations rejects zero parallelism" {
     }));
 }
 
+test "runEvaluations rejects excessive parallelism" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const evals = [_]registry.EvalDefinition{evalDefinition("eval.invalid", "cases.jsonl", null)};
+    const configured_services = [_]services.ServiceConfig{serviceConfig("svc")};
+
+    try std.testing.expectError(error.InvalidParallelism, runEvaluations(std.testing.allocator, .{
+        .root_dir = tmp.dir,
+        .services = configured_services[0..],
+        .evals = evals[0..],
+        .parallelism = max_parallelism + 1,
+        .service_caller = fakeServiceCaller,
+        .matcher_evaluator = fakeMatcherPass,
+    }));
+}
+
 test "runEvaluations rejects zero max inflight per service" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1056,6 +1126,40 @@ test "runEvaluations rejects zero max inflight per service" {
         .services = configured_services[0..],
         .evals = evals[0..],
         .max_inflight_per_service = 0,
+        .service_caller = fakeServiceCaller,
+        .matcher_evaluator = fakeMatcherPass,
+    }));
+}
+
+test "runEvaluations rejects excessive max inflight per service" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const evals = [_]registry.EvalDefinition{evalDefinition("eval.invalid", "cases.jsonl", null)};
+    const configured_services = [_]services.ServiceConfig{serviceConfig("svc")};
+
+    try std.testing.expectError(error.InvalidMaxInflightPerService, runEvaluations(std.testing.allocator, .{
+        .root_dir = tmp.dir,
+        .services = configured_services[0..],
+        .evals = evals[0..],
+        .max_inflight_per_service = max_inflight_per_service + 1,
+        .service_caller = fakeServiceCaller,
+        .matcher_evaluator = fakeMatcherPass,
+    }));
+}
+
+test "runEvaluations rejects excessive run count override" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const evals = [_]registry.EvalDefinition{evalDefinition("eval.invalid", "cases.jsonl", null)};
+    const configured_services = [_]services.ServiceConfig{serviceConfig("svc")};
+
+    try std.testing.expectError(error.InvalidRunCount, runEvaluations(std.testing.allocator, .{
+        .root_dir = tmp.dir,
+        .services = configured_services[0..],
+        .evals = evals[0..],
+        .run_count_override = max_run_count + 1,
         .service_caller = fakeServiceCaller,
         .matcher_evaluator = fakeMatcherPass,
     }));
@@ -1102,8 +1206,50 @@ test "runEvaluations records detailed service failure retry metadata" {
     try std.testing.expectEqual(@as(usize, 1), result.runs.len);
     try std.testing.expect(!result.runs[0].passed);
     try std.testing.expectEqualStrings("upstream unavailable", result.runs[0].failure_reason.?);
+    try std.testing.expectEqual(@as(u16, 503), result.runs[0].status_code.?);
     try std.testing.expectEqual(@as(u32, 3), result.runs[0].attempt_count);
     try std.testing.expect(result.runs[0].retried);
+}
+
+test "runEvaluations records model_grade judge retry metadata" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeDataset(tmp.dir, "cases.jsonl", "case-1", "prompt");
+
+    const allowlist = [_][]const u8{"product"};
+    const evals = [_]registry.EvalDefinition{evalDefinitionWithMatcher(
+        "eval.model_grade_retry",
+        "cases.jsonl",
+        allowlist[0..],
+        .{
+            .model_grade = .{
+                .judge_service = "judge",
+                .rubric = "Score correctness.",
+                .pass_score = 0.8,
+            },
+        },
+    )};
+    const configured_services = [_]services.ServiceConfig{
+        serviceConfig("product"),
+        serviceConfig("judge"),
+    };
+
+    var result = try runEvaluations(std.testing.allocator, .{
+        .root_dir = tmp.dir,
+        .services = configured_services[0..],
+        .evals = evals[0..],
+        .service_caller = fakeRetryingJudgeServiceCaller,
+        .matcher_evaluator = fakeMatcherPass,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.runs.len);
+    try std.testing.expect(result.runs[0].passed);
+    try std.testing.expectEqual(@as(u32, 4), result.runs[0].attempt_count);
+    try std.testing.expect(result.runs[0].retried);
+    try std.testing.expectEqual(@as(u32, 3), result.runs[0].judge_attempt_count);
+    try std.testing.expect(result.runs[0].judge_retried);
+    try std.testing.expectEqual(@as(u16, 200), result.runs[0].judge_status_code.?);
 }
 
 test "runEvaluations propagates parallel worker progress writer errors" {
@@ -1371,6 +1517,27 @@ fn fakeFailingJudgeServiceCaller(
     return fakeSuccess(allocator, service.default_model, "candidate answer");
 }
 
+fn fakeRetryingJudgeServiceCaller(
+    allocator: std.mem.Allocator,
+    service: services.ServiceConfig,
+    input: services.ChatCallInput,
+) anyerror!services.ChatCallResult {
+    _ = input;
+    if (std.mem.eql(u8, service.name, "judge")) {
+        return .{
+            .success = .{
+                .content = try allocator.dupe(u8, "{\"score\":0.9,\"passed\":true,\"reason\":\"Correct.\"}"),
+                .model = try allocator.dupe(u8, service.default_model),
+                .status_code = 200,
+                .attempt_count = 3,
+                .retried = true,
+            },
+        };
+    }
+
+    return fakeSuccess(allocator, service.default_model, "candidate answer");
+}
+
 fn fakeToolServiceCaller(
     allocator: std.mem.Allocator,
     service: services.ServiceConfig,
@@ -1463,4 +1630,20 @@ fn fakeMatcherPass(
     _ = output;
     _ = ideal;
     return .{ .passed = true, .score = 1.0 };
+}
+
+test "parseJudgeOutcome propagates out of memory" {
+    var failing_allocator = std.testing.FailingAllocator.init(
+        std.testing.allocator,
+        .{ .fail_index = 0 },
+    );
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        parseJudgeOutcome(
+            failing_allocator.allocator(),
+            "{\"passed\":true,\"score\":1,\"reason\":\"ok\"}",
+            0.5,
+        ),
+    );
 }

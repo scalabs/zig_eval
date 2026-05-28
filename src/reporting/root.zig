@@ -331,11 +331,31 @@ fn writeRunResultJson(json_writer: *std.json.Stringify, result: runner.RunResult
         try json_writer.write(@as(?[]const u8, null));
     }
 
+    try json_writer.objectField("status_code");
+    if (result.status_code) |status_code| {
+        try json_writer.write(status_code);
+    } else {
+        try json_writer.write(@as(?u16, null));
+    }
+
     try json_writer.objectField("attempt_count");
     try json_writer.write(result.attempt_count);
 
     try json_writer.objectField("retried");
     try json_writer.write(result.retried);
+
+    try json_writer.objectField("judge_attempt_count");
+    try json_writer.write(result.judge_attempt_count);
+
+    try json_writer.objectField("judge_retried");
+    try json_writer.write(result.judge_retried);
+
+    try json_writer.objectField("judge_status_code");
+    if (result.judge_status_code) |status_code| {
+        try json_writer.write(status_code);
+    } else {
+        try json_writer.write(@as(?u16, null));
+    }
 
     try json_writer.objectField("latency_ms");
     try json_writer.write(result.latency_ms);
@@ -873,6 +893,7 @@ fn sampleRun(
         .passed = passed,
         .score = if (passed) 1.0 else 0.0,
         .failure_reason = if (passed) null else "failed",
+        .status_code = if (passed) 200 else 503,
         .attempt_count = if (passed) 1 else 2,
         .retried = !passed,
         .latency_ms = latency_ms,
@@ -1078,8 +1099,49 @@ test "formatRunResultsJson writes machine readable run artifacts" {
     try std.testing.expect(runs[0].object.get("passed").?.bool);
     try std.testing.expectEqual(@as(i64, 30), runs[1].object.get("latency_ms").?.integer);
     try std.testing.expectEqualStrings("failed", runs[1].object.get("failure_reason").?.string);
+    try std.testing.expectEqual(@as(i64, 200), runs[0].object.get("status_code").?.integer);
+    try std.testing.expectEqual(@as(i64, 503), runs[1].object.get("status_code").?.integer);
     try std.testing.expectEqual(@as(i64, 2), runs[1].object.get("attempt_count").?.integer);
     try std.testing.expect(runs[1].object.get("retried").?.bool);
+    try std.testing.expectEqual(@as(i64, 0), runs[0].object.get("judge_attempt_count").?.integer);
+    try std.testing.expect(!runs[0].object.get("judge_retried").?.bool);
+    try std.testing.expect(runs[0].object.get("judge_status_code").? == .null);
+}
+
+test "formatRunResultsJson writes judge metadata" {
+    const result = runner.RunResult{
+        .group = "quality",
+        .eval_id = "quality.helpful_summary",
+        .service_name = "product-api",
+        .model = "model-a",
+        .run_index = 1,
+        .case_id = "case-1",
+        .output = "summary",
+        .passed = true,
+        .score = 0.9,
+        .status_code = 200,
+        .attempt_count = 4,
+        .retried = true,
+        .judge_attempt_count = 3,
+        .judge_retried = true,
+        .judge_status_code = 200,
+        .latency_ms = 50,
+    };
+
+    var out = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer out.deinit();
+
+    try formatRunResultsJson(&out.writer, &.{result});
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, out.written(), .{});
+    defer parsed.deinit();
+
+    const run = parsed.value.object.get("runs").?.array.items[0].object;
+    try std.testing.expectEqual(@as(i64, 4), run.get("attempt_count").?.integer);
+    try std.testing.expect(run.get("retried").?.bool);
+    try std.testing.expectEqual(@as(i64, 3), run.get("judge_attempt_count").?.integer);
+    try std.testing.expect(run.get("judge_retried").?.bool);
+    try std.testing.expectEqual(@as(i64, 200), run.get("judge_status_code").?.integer);
 }
 
 test "formatEvalReportsJson writes grouped aggregate artifacts" {
@@ -1122,6 +1184,33 @@ test "formatEvalReportsJson writes grouped aggregate artifacts" {
     const model_reports = service_reports[0].object.get("models").?.array.items;
     try std.testing.expectEqualStrings("model-a", model_reports[0].object.get("model").?.string);
     try std.testing.expectEqual(@as(i64, 30), model_reports[0].object.get("stats").?.object.get("latency").?.object.get("p95_ms").?.integer);
+}
+
+test "aggregateRunResults counts combined candidate and judge attempts" {
+    const result = runner.RunResult{
+        .group = "quality",
+        .eval_id = "quality.helpful_summary",
+        .service_name = "product-api",
+        .model = "model-a",
+        .run_index = 1,
+        .case_id = "case-1",
+        .output = "summary",
+        .passed = true,
+        .score = 0.9,
+        .status_code = 200,
+        .attempt_count = 4,
+        .retried = true,
+        .judge_attempt_count = 3,
+        .judge_retried = true,
+        .judge_status_code = 200,
+        .latency_ms = 50,
+    };
+
+    var owned = try aggregateRunResults(std.testing.allocator, &.{result});
+    defer owned.deinit();
+
+    try std.testing.expectEqual(@as(usize, 4), owned.items[0].stats.retries.total_attempts);
+    try std.testing.expectEqual(@as(usize, 1), owned.items[0].stats.retries.retried_runs);
 }
 
 test "compareServicesToBaseline computes pass-rate delta" {

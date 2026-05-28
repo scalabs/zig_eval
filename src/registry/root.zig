@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const matchers = @import("../matchers/root.zig");
 
 const max_eval_file_bytes = 1024 * 1024;
@@ -164,14 +165,15 @@ pub fn loadEvalCases(
     dir: std.fs.Dir,
     path: []const u8,
 ) !LoadedEvalCases {
-    try validateDatasetRelativePath(path);
+    const real_path = try datasetRealPathAlloc(allocator, dir, path);
+    defer allocator.free(real_path);
 
     const arena = try allocator.create(std.heap.ArenaAllocator);
     arena.* = std.heap.ArenaAllocator.init(allocator);
     errdefer allocator.destroy(arena);
     errdefer arena.deinit();
 
-    const raw = try dir.readFileAlloc(allocator, path, max_dataset_file_bytes);
+    const raw = try readResolvedFileAlloc(allocator, real_path, max_dataset_file_bytes);
     defer allocator.free(raw);
 
     var items = std.ArrayList(EvalCase){};
@@ -182,13 +184,14 @@ pub fn loadEvalCases(
         const line = std.mem.trim(u8, line_raw, " \t\r\n");
         if (line.len == 0) continue;
 
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch {
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch |err| {
+            if (err == error.OutOfMemory) return err;
             return error.InvalidJsonLines;
         };
         defer parsed.deinit();
 
         const eval_case = try parseEvalCase(arena.allocator(), parsed.value);
-        try validateEvalCaseAttachments(dir, eval_case);
+        try validateEvalCaseAttachments(allocator, dir, eval_case);
         try items.append(allocator, eval_case);
     }
 
@@ -208,13 +211,14 @@ fn loadEvalDefinitionWithAllocator(
     const raw = try dir.readFileAlloc(temp_allocator, path, max_eval_file_bytes);
     defer temp_allocator.free(raw);
 
-    var parsed = std.json.parseFromSlice(std.json.Value, temp_allocator, raw, .{}) catch {
+    var parsed = std.json.parseFromSlice(std.json.Value, temp_allocator, raw, .{}) catch |err| {
+        if (err == error.OutOfMemory) return err;
         return error.InvalidEvalDefinitionJson;
     };
     defer parsed.deinit();
 
     const definition = try parseEvalDefinition(arena_allocator, parsed.value);
-    validateDatasetPath(dir, definition.dataset_path) catch |err| switch (err) {
+    validateDatasetPath(temp_allocator, dir, definition.dataset_path) catch |err| switch (err) {
         error.FileNotFound => return error.MissingDatasetFile,
         else => return err,
     };
@@ -223,11 +227,11 @@ fn loadEvalDefinitionWithAllocator(
 }
 
 fn validateDatasetPath(
+    allocator: std.mem.Allocator,
     dir: std.fs.Dir,
     dataset_path: []const u8,
 ) !void {
-    try validateDatasetRelativePath(dataset_path);
-    try dir.access(dataset_path, .{});
+    try validateDatasetPathWithinRoot(allocator, dir, dataset_path);
 }
 
 fn parseEvalDefinition(
@@ -282,7 +286,8 @@ fn parseRequiredMatcher(
     object: std.json.ObjectMap,
 ) !matchers.MatcherConfig {
     const value = object.get("matcher") orelse return error.InvalidEvalDefinition;
-    return matchers.parseMatcherConfig(allocator, value) catch {
+    return matchers.parseMatcherConfig(allocator, value) catch |err| {
+        if (err == error.OutOfMemory) return err;
         return error.InvalidEvalDefinition;
     };
 }
@@ -325,7 +330,8 @@ fn validateToolParametersJson(
     allocator: std.mem.Allocator,
     parameters_json: []const u8,
 ) !void {
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, parameters_json, .{}) catch {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, parameters_json, .{}) catch |err| {
+        if (err == error.OutOfMemory) return err;
         return error.InvalidEvalDefinition;
     };
     defer parsed.deinit();
@@ -421,14 +427,25 @@ fn parseAttachmentKind(object: std.json.ObjectMap) !AttachmentKind {
     return error.InvalidEvalCase;
 }
 
-fn validateEvalCaseAttachments(dir: std.fs.Dir, eval_case: EvalCase) !void {
+fn validateEvalCaseAttachments(
+    allocator: std.mem.Allocator,
+    dir: std.fs.Dir,
+    eval_case: EvalCase,
+) !void {
     const attachments = eval_case.attachments orelse return;
     for (attachments) |attachment| {
-        const stat = dir.statFile(attachment.path) catch |err| switch (err) {
+        const real_path = attachmentRealPathAlloc(allocator, dir, attachment.path) catch |err| switch (err) {
             error.FileNotFound => return error.MissingAttachmentFile,
             else => return err,
         };
-        if (stat.size > max_attachment_bytes) return error.AttachmentTooLarge;
+        defer allocator.free(real_path);
+        var file = std.fs.openFileAbsolute(real_path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return error.MissingAttachmentFile,
+            else => return err,
+        };
+        defer file.close();
+        const size = try file.getEndPos();
+        if (size > max_attachment_bytes) return error.AttachmentTooLarge;
     }
 }
 
@@ -438,6 +455,42 @@ fn validateAttachmentPath(path: []const u8) !void {
 
 fn validateDatasetRelativePath(path: []const u8) !void {
     if (!isSafeRelativePath(path)) return error.InvalidDatasetPath;
+}
+
+pub fn validateAttachmentPathWithinRoot(
+    allocator: std.mem.Allocator,
+    dir: std.fs.Dir,
+    path: []const u8,
+) !void {
+    const real_path = try attachmentRealPathAlloc(allocator, dir, path);
+    allocator.free(real_path);
+}
+
+pub fn validateDatasetPathWithinRoot(
+    allocator: std.mem.Allocator,
+    dir: std.fs.Dir,
+    path: []const u8,
+) !void {
+    const real_path = try datasetRealPathAlloc(allocator, dir, path);
+    allocator.free(real_path);
+}
+
+pub fn attachmentRealPathAlloc(
+    allocator: std.mem.Allocator,
+    dir: std.fs.Dir,
+    path: []const u8,
+) ![]u8 {
+    try validateAttachmentPath(path);
+    return try realPathWithinDirAlloc(allocator, dir, path, error.InvalidAttachmentPath);
+}
+
+pub fn datasetRealPathAlloc(
+    allocator: std.mem.Allocator,
+    dir: std.fs.Dir,
+    path: []const u8,
+) ![]u8 {
+    try validateDatasetRelativePath(path);
+    return try realPathWithinDirAlloc(allocator, dir, path, error.InvalidDatasetPath);
 }
 
 fn isSafeRelativePath(path: []const u8) bool {
@@ -450,6 +503,49 @@ fn isSafeRelativePath(path: []const u8) bool {
         }
     }
     return true;
+}
+
+fn validatePathStaysWithinDir(
+    allocator: std.mem.Allocator,
+    dir: std.fs.Dir,
+    path: []const u8,
+    invalid_path_error: anyerror,
+) !void {
+    const path_real = try realPathWithinDirAlloc(allocator, dir, path, invalid_path_error);
+    allocator.free(path_real);
+}
+
+fn realPathWithinDirAlloc(
+    allocator: std.mem.Allocator,
+    dir: std.fs.Dir,
+    path: []const u8,
+    invalid_path_error: anyerror,
+) ![]u8 {
+    const root_real = try dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root_real);
+
+    const path_real = try dir.realpathAlloc(allocator, path);
+    errdefer allocator.free(path_real);
+
+    if (!pathIsWithinRoot(root_real, path_real)) return invalid_path_error;
+    return path_real;
+}
+
+fn readResolvedFileAlloc(
+    allocator: std.mem.Allocator,
+    real_path: []const u8,
+    max_bytes: usize,
+) ![]u8 {
+    var file = try std.fs.openFileAbsolute(real_path, .{});
+    defer file.close();
+    return try file.readToEndAlloc(allocator, max_bytes);
+}
+
+fn pathIsWithinRoot(root_real: []const u8, path_real: []const u8) bool {
+    if (std.mem.eql(u8, root_real, path_real)) return true;
+    if (!std.mem.startsWith(u8, path_real, root_real)) return false;
+    if (path_real.len <= root_real.len) return false;
+    return path_real[root_real.len] == std.fs.path.sep;
 }
 
 fn validateAttachmentKindMime(kind: AttachmentKind, mime_type: []const u8) !void {
@@ -847,6 +943,50 @@ test "loadEvalCases rejects absolute dataset paths directly" {
     );
 }
 
+test "loadEvalCases rejects dataset symlink escaping registry root" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("registry/data");
+    try tmp.dir.writeFile(.{
+        .sub_path = "secret.jsonl",
+        .data = "{\"id\":\"case-1\",\"input\":\"secret\"}\n",
+    });
+    var registry_dir = try tmp.dir.openDir("registry", .{});
+    defer registry_dir.close();
+
+    try registry_dir.symLink("../../secret.jsonl", "data/link.jsonl", .{});
+
+    try std.testing.expectError(
+        error.InvalidDatasetPath,
+        loadEvalCases(std.testing.allocator, registry_dir, "data/link.jsonl"),
+    );
+}
+
+test "loadEvalCases allows dataset symlink inside registry root" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("registry/data/real");
+    try tmp.dir.writeFile(.{
+        .sub_path = "registry/data/real/test.jsonl",
+        .data = "{\"id\":\"case-1\",\"input\":\"Reply with OK\",\"ideal\":\"OK\"}\n",
+    });
+    var registry_dir = try tmp.dir.openDir("registry", .{});
+    defer registry_dir.close();
+
+    try registry_dir.symLink("real/test.jsonl", "data/link.jsonl", .{});
+
+    var loaded = try loadEvalCases(std.testing.allocator, registry_dir, "data/link.jsonl");
+    defer loaded.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), loaded.items.len);
+}
+
 test "loadEvalCases rejects malformed JSONL lines" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1194,6 +1334,32 @@ test "loadEvalCases rejects missing attachment files" {
     );
 }
 
+test "loadEvalCases rejects attachment symlink escaping registry root" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("registry/assets");
+    try tmp.dir.writeFile(.{
+        .sub_path = "secret.md",
+        .data = "secret",
+    });
+    var registry_dir = try tmp.dir.openDir("registry", .{});
+    defer registry_dir.close();
+
+    try registry_dir.symLink("../../secret.md", "assets/link.md", .{});
+    try registry_dir.writeFile(.{
+        .sub_path = "cases.jsonl",
+        .data = "{\"id\":\"case-1\",\"input\":\"Summarize\",\"attachments\":[{\"kind\":\"file\",\"path\":\"assets/link.md\",\"mime_type\":\"text/markdown\"}]}\n",
+    });
+
+    try std.testing.expectError(
+        error.InvalidAttachmentPath,
+        loadEvalCases(std.testing.allocator, registry_dir, "cases.jsonl"),
+    );
+}
+
 test "parseEvalCase rejects unsafe attachment paths" {
     const json =
         \\{
@@ -1317,5 +1483,17 @@ test "parseEvalCase rejects file attachment with image mime type" {
     try std.testing.expectError(
         error.InvalidAttachmentMimeType,
         parseEvalCase(arena.allocator(), parsed_json.value),
+    );
+}
+
+test "validateToolParametersJson propagates out of memory" {
+    var failing_allocator = std.testing.FailingAllocator.init(
+        std.testing.allocator,
+        .{ .fail_index = 0 },
+    );
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        validateToolParametersJson(failing_allocator.allocator(), "{\"type\":\"object\"}"),
     );
 }
